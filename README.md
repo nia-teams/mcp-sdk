@@ -53,6 +53,11 @@ OIDC-based confirmation without that webhook secret.
 Maintained by **Nia Teams** · [GitHub](https://github.com/nia-teams/mcp-sdk) ·
 [MIT](LICENSE) · [AI agent guide](./AGENTS.md) · [Protocol specification](./docs/SPECIFICATION.md)
 
+**Start here:** [five-step deployment guide](#from-zero-to-mounted-in-nia-teams-five-steps) ·
+[OIDC claims](#oidc-agent-identity-is-not-human-authority) ·
+[permission matrix](#permission-matrix-whose-authority-do-you-check) ·
+[code examples](#1-authenticate-a-workload)
+
 ## End-to-end: three flows, one enterprise MCP server
 
 ```text
@@ -104,6 +109,296 @@ owns its credentials and viewer context; the server owns the business decision.
 
 This package does **not** replace MCP, implement an Apps host, or bundle upstream
 SDKs. Standard MCP clients continue to see ordinary `content[].text` results.
+
+## From zero to mounted in Nia Teams: five steps
+
+1. **Initialize your enterprise MCP project.**
+   ```sh
+   mkdir enterprise-mcp && cd enterprise-mcp
+   npm init -y
+   npm pkg set type=module
+   npm install @nia-teams/mcp-sdk @modelcontextprotocol/sdk @modelcontextprotocol/ext-apps zod
+   npm install --save-dev typescript @types/node vitest
+   ```
+2. **Authenticate your HTTP `/mcp` boundary before dispatching MCP.** Use the
+   official `StreamableHTTPServerTransport`; this SDK does not serve HTTP for you.
+   ```ts
+   const auth = createWorkloadOidcVerifier(); // import from /auth
+   const identity = await auth.verifyBearerHeader(req.headers.authorization, {
+     allowedSubjects: ["sec-ops"],
+     requiredGroups: ["role:logs.reader"],
+   });
+   // Bind authorized business queries to identity, then handleRequest(req, res).
+   ```
+   See [the complete HTTP example](examples/01-readonly-workload-oidc.ts).
+   Use a separate, explicitly authorized callback policy for platform service
+   requests; do not indiscriminately allow service principals on read/write routes.
+3. **Register your capabilities.** Read tools use the verified Agent scope.
+   Write tools propose `createMcpConfirmCard` and execute only after
+   `verifyHumanActionContext` plus durable business CAS. Workspace Apps use
+   `registerNiaWorkspaceApp`, `verifyBoundViewer`, a strict API allowlist, and
+   Vite + `vite-plugin-singlefile`. The three scenarios below provide code.
+4. **Test offline before deploying.** Put a Vitest test around the local issuer
+   example in [Offline tests](#offline-tests), then `npx vitest run`. Use
+   `createWorkloadOidcProvider`, `generateTestRsaKeyPair`, and
+   `signTestConfirmationToken`, with public `jwks` passed to the verifier.
+   Add a real official `InMemoryTransport` Server/Client test, including rejected
+   credentials, tampered arguments, member/admin/owner gates, and replay/CAS.
+   Tests need no live Nia Teams connection and normally run in seconds; runtime
+   is hardware-dependent, not a guaranteed one-second service-level promise.
+5. **Deploy, mount, and approve the wiring.** Expose a reachable HTTPS MCP
+   endpoint, for example `https://ops.example.com/mcp`. Ask your Nia Teams Agent:
+   **“Connect MCP server `my-ops` at `https://ops.example.com/mcp`.”** Confirm the
+   resulting TaskBar card as that **Agent Team's owner or admin**. Alternatively
+   use the Agent Settings UI. Then ask the Agent to call a read/proposal tool;
+   open the workspace from Apps and verify the expected role restrictions.
+
+### Mounting scopes, endpoint rules, and tool names
+
+| Mount                   | Configuration and lifetime                                                                                                     | What it may override                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| Agent Team custom mount | Team `mcpServers`, proposed through `mcp_servers` or configured in Agent Settings; applies to that Agent Team                  | Other Team-added entries by name, never Blueprint built-ins                                         |
+| Routine overlay         | Routine `mcpServers`; only sessions spawned with that Routine's scope; connection cache `${teamId}:${routineId}:${serverName}` | Same-named Team-added entry locally, or append a new name; never Blueprint built-ins                |
+| Blueprint built-in      | Platform catalog connection referenced by Blueprint `mcpManifest`; locked for consuming Teams/Routines                         | Team/Routine config cannot remove, disable, or override it; platform catalog management is separate |
+
+A chat request proposes a mount; **it does not grant the requester's authority**.
+A regular member can request a change. The built-in `mcp_servers` call is:
+
+```json
+{
+  "action": "update",
+  "upsert": [{ "name": "my-ops", "url": "https://ops.example.com/mcp" }]
+}
+```
+
+It emits a TaskBar confirmation card and does not change wiring until approved.
+For webhook cards, an entry may additionally set `webhookSecret`; it is optional
+and unnecessary for OIDC-based MCP callbacks. Treat it as a real secret, not
+public chat/debug output. Configure secrets only through an appropriate trusted
+management surface. Re-read current configuration before applying changes.
+
+**Mount confirmation requires a live Team `owner` or `admin`.** Platform admin
+is a separate platform-management privilege, not an automatic Team role: the
+current mount-card handler checks Team owner/admin membership, so do not assume
+that platform-admin status alone can confirm this card. Separate platform
+management endpoints may have their own explicit authorization.
+
+The endpoint must use `http://` or `https://` and speak **Streamable HTTP** at the
+actual MCP path (commonly `POST /mcp`), not an arbitrary REST API, stdio command,
+or legacy SSE-only endpoint. Use HTTPS in production because HTTP exposes Bearer
+credentials. It must be reachable **from Nia Teams**, not merely from your laptop.
+Custom mounts reject SSRF targets including `localhost`, `127.0.0.0/8`, RFC1918
+`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, link-local `169.254.0.0/16`,
+and `.local` / `.internal` names; additional IPv4/IPv6 special ranges are blocked.
+A private enterprise integration needs an explicitly platform-managed network /
+catalog arrangement. **Catalog registration is not a documented blanket SSRF
+bypass**; current client URL validation also runs for resolved catalog entries.
+Do not try to work around it with URL tricks or disable authentication.
+
+Default Agent-visible tool names are `mcp__<serverName>__<toolName>`:
+`query_logs` on `my-ops` becomes `mcp__my-ops__query_logs`. The mount name must
+match `^[a-zA-Z0-9-]+$`. Some host surfaces can flatten unique tool names; this
+is a presentation policy, not a wire-name change. Register raw `query_logs` on
+your server. Card handlers and signed context checks use **mount name `my-ops`**
+and raw tool name, not the prefixed Agent-visible name or `serverInfo.name`.
+
+**Automatic credentials:** omit a custom `Authorization` header from a normal
+mount entry. The host injects a valid RS256 workload Bearer token on **every HTTP
+request**, caches it with a **300-second TTL**, and refreshes it **30 seconds
+before expiry**, independently of the MCP connection. It does not mint a new JWT
+for every request. An explicitly configured Authorization header (any casing)
+opts normal mounts out of automatic injection; remove a stale static header
+rather than debugging it as an SDK JWKS problem. Platform-brokered service/card
+transports have their own service-token policy.
+
+## OIDC: Agent identity is not human authority
+
+OIDC here means the host signs an identity JWT with its private RSA key; your
+server verifies its signature and claims using the issuer's **public** JWKS.
+You do not need the signing secret or a per-Agent static API key. Discovery is
+`https://nia-teams.com/.well-known/openid-configuration`; public keys are at
+`https://nia-teams.com/oauth2/jwks`. Only **RS256** is accepted.
+
+Illustrative normal HTTP Bearer payload (times are examples):
+
+```json
+{
+  "iss": "https://nia-teams.com",
+  "aud": "nia-teams-workload",
+  "sub": "sec-ops",
+  "principal_type": "workload",
+  "iat": 1790812800,
+  "nbf": 1790812800,
+  "exp": 1790813100,
+  "jti": "example-unique-token-id",
+  "groups": ["team:sec-ops", "org:example", "role:logs.reader"]
+}
+```
+
+| Claim / group                                            | Meaning, not an implied permission                                                                                                   |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `sub: <agentTeamSlug>`                                   | Agent Team workload, e.g. `sec-ops` or `luca-root-agent`; **not** the chatting human                                                 |
+| `principal_type: "workload"`                             | Normal Agent execution                                                                                                               |
+| `sub: "nia-teams-platform"`, `principal_type: "service"` | Platform-brokered transport, including card callbacks; no blanket write permission                                                   |
+| `team:<agentSlug>`                                       | Agent Team identity                                                                                                                  |
+| `org:<orgSlug>`                                          | Agent Team's Organization, if present                                                                                                |
+| `role:<roleKey>`                                         | Platform `AuthorizationRole` bound to this Agent, e.g. `logs.reader` or `nia.infra-agent`; **not** a human `owner/admin/member` role |
+| `nia:elevated:role:<roleKey>`                            | Explicit temporary human-approved role elevation, e.g. via `request_session_elevation`; not an ordinary role grant                   |
+
+`verifyBearerHeader(header, { allowedSubjects, requiredGroups,
+allowServicePrincipal })` verifies the JWT and policy. `requiredGroups` requires
+**all** exact group strings; returned `identity.teams`, `.orgs`, `.roles`, and
+`.elevatedRoles` contain deduplicated, prefix-stripped values. For example,
+`role:logs.reader` yields `identity.roles.includes('logs.reader')`. An ordinary
+role group alone never proves elevation. Role-specific elevated credentials can
+have `sub: role:<roleKey>:elevated`; apply the intended subject policy, do not
+assume every valid token has a Team slug. The generic automatically injected
+Team Bearer does **not** promise to carry a Session's elevation; approved Session
+credentials and explicitly brokered human-App elevation are separate paths.
+
+The outer Bearer answers **“which Agent/service is calling?”** A signed
+`nia/confirmationToken` / `nia/viewerContextToken` answers **“which human confirmed
+or viewed this exact card RPC?”** `nia/sourceContextToken` carries bounded source
+Team/actor context on supported role-mounted calls. All bind server/tool/
+`context_arguments_sha256`, and context TTL is at most five minutes. Not every
+custom mount receives a source-context token or a signed Team role. An App's
+`boundContext` is a host assertion, **not a signed JWT by itself**.
+
+## Permission matrix: whose authority do you check?
+
+Human Team roles, Agent workload groups, platform administration, GroupChat
+membership, and external OAuth permissions are **different authority domains**.
+The Agent Team owner (initially its creator, transferable under ownership rules)
+controls the Team and ownership/member administration;
+admins manage allowed Team configuration; members chat and access permitted
+sessions/apps. Ownership-sensitive actions and private-session visibility still
+have separate gates. Neither a role title nor a valid signature bypasses your
+enterprise business ACL.
+
+| Action / surface                                 | Team owner                          | Team admin                        | Team member                        | External identity / outsider                                     |
+| ------------------------------------------------ | ----------------------------------- | --------------------------------- | ---------------------------------- | ---------------------------------------------------------------- |
+| Chat / permitted execution records               | Yes, subject to chat/session access | Same                              | Same                               | GroupChat membership alone does not open Agent execution records |
+| Confirm `mcp_servers` configuration change       | Yes                                 | Yes                               | No; may propose                    | External OAuth is not mount authority                            |
+| Ordinary confirmation card, no external identity | Default membership gate passes      | Passes                            | Passes                             | Source-Team membership normally required                         |
+| Privileged card                                  | Only if that card's policy allows   | Only if that card's policy allows | No when owner/admin is required    | Upstream/provider policy may be decisive                         |
+| GroupChat App, no admin flag                     | Yes\*                               | Yes\*                             | Yes\*                              | No, not merely because they are in the chat                      |
+| GroupChat App with `requireTeamAdmin: true`      | Yes\*                               | Yes\*                             | Hidden from Apps menu; open denied | No implicit bypass                                               |
+| Owner-only enterprise operation                  | Passes explicit owner check         | Denied                            | Denied                             | Only an explicitly configured alternative enterprise ACL         |
+| Card with `action.requiresIdentity`              | Provider ACL applies                | Provider ACL applies              | Provider ACL applies               | Can be eligible cross-Team; must satisfy provider/business ACL   |
+
+\* For GroupChat-bound Apps the user must belong to **both the GroupChat and the
+Agent Team**, and the Agent must be in that GroupChat (`isAgentExecutionAccessible`).
+Non-admin Apps are not public Apps. Platform-admin status is not an implicit
+Team membership / workspace-control override.
+
+### A. Agent read / proposal tool
+
+Verify outer HTTP OIDC, then check `identity.subject` with `allowedSubjects`,
+organization scope through `identity.orgs`, and required Agent grants through
+`requiredGroups` / `identity.roles`. `_meta.boundContext` may accompany a
+Routine/App-bound call but is not human consent by itself. AI calls must not
+silently execute the proposed mutation.
+
+### B. Human confirms a TaskBar card
+
+**Host gate:** ordinary cards use `checkTeamMembership`: owner, admin, or member
+of the emitting Agent Team may confirm by default. Privileged built-ins add
+narrower checks. Some platform-special cards have resource-specific exceptions;
+do not copy their bypasses into an enterprise executor.
+
+If `action.requiresIdentity: { provider, instance? }` is declared,
+`clickBypassesTeamCheck` bypasses the ordinary source-Team membership gate. The
+host resolves the clicker's provider credential or prompts authorization, and
+passes `_meta['nia/identityToken']`, whose SHA-256 digest is signed as
+`context_identity_token_sha256`. This supports legitimate cross-Team approval;
+it is **not** automatic permission to mutate upstream resources. The executor
+must validate the external token and upstream ACL (e.g. repository Maintainer).
+Other chat/card visibility and resource-specific checks still apply.
+
+**Your gate:** call `verifyHumanActionContext(extra._meta, { server, tool,
+arguments: args, expectedCardId })`. It returns `confirmedBy` (a Nia Teams user
+ID, e.g. dummy `0123456789abcdef01234567`), `confirmedByName`, `cardId`, `jti`,
+optional `identityToken`, and optional `sourceTeam: { id, subject, groups, role? }`.
+A verified ordinary confirmation is **not** proof of admin or owner status.
+
+```ts
+const human = await auth.verifyHumanActionContext(extra._meta, {
+  server: "my-ops",
+  tool: "apply_change",
+  arguments: args,
+  expectedCardId,
+});
+// Owner OR admin, only when the host bound that role into the signed context:
+if (human.sourceTeam?.role !== "owner" && human.sourceTeam?.role !== "admin") {
+  throw new WorkloadOidcError(
+    403,
+    "Signed Team owner or admin authority required",
+  );
+}
+// For owner-only operations use: human.sourceTeam?.role === "owner".
+// Then enforce your resource ACL and a durable CAS before any side effect.
+```
+
+Import `WorkloadOidcError` from `/auth`. `sourceTeam.role` is optional and is
+**not currently attached to every custom card**. If absent, fail closed or use
+an authoritative enterprise admin/owner roster keyed by `human.confirmedBy`, or
+validate `human.identityToken` and the upstream ACL. Never infer a missing role
+from `confirmedByName`, Agent `groups`, or producer-supplied metadata. A
+`requiresIdentity` declaration can widen the host's default membership gate;
+do not add it merely to make an authorization error disappear.
+
+### C. Human opens and uses a Workspace App
+
+The GroupChat Apps catalog and launch path check execution access. With
+`_meta['nia/requireTeamAdmin']: true`, ordinary members do not see the App in the
+top Apps menu and `/apps/open` rejects them with 403:
+`Only Team owner or admin can open this App`. Without the flag, all three Team
+roles can open it, subject to the GroupChat/Agent access checks above.
+
+For Agent-bound App entry and iframe calls through
+`POST /api/teams/:teamId/mcp-app-tool-call`, the host re-resolves the live Team
+role with `roleFromTeam` and injects:
+
+```json
+{
+  "_meta": {
+    "boundContext": {
+      "viewerUserId": "0123456789abcdef01234567",
+      "viewerTeamRole": "owner"
+    }
+  }
+}
+```
+
+After authenticating/authorizing the platform transport, check **every entryTool
+and apiTool** (not just the initial HTML load):
+
+```ts
+// All Team roles: owner / admin / member.
+const viewer = verifyBoundViewer(extra._meta);
+// Owner or admin; throws 403 for member.
+const privileged = verifyBoundViewer(extra._meta, { requireTeamAdmin: true });
+// Owner only; no built-in owner-only boolean exists.
+if (viewer.viewerTeamRole !== "owner") {
+  throw new WorkloadOidcError(403, "Team owner required");
+}
+// These are alternative policies; choose one per operation.
+// Audit viewer.actor: "user:<viewerUserId>"; enforce route/body/business ACLs too.
+```
+
+The metadata flag advertises a **launch** restriction; `verifyBoundViewer`
+enforces your handler's role restriction. There is no owner-only metadata flag;
+an owner-only handler may still be advertised to admins, who must be denied
+when they invoke it. A raw MCP client can forge metadata; do not trust a
+workload token from an arbitrary client as proof that its `boundContext` came
+from the host. Use a trusted host transport boundary and signed contexts where
+available. See the workspace code below for `createSafeApiPathChecker`.
+
+### D. Changing Agent wiring is not an enterprise write permission
+
+The built-in `mcp_servers` proposal can be requested by a chatting user, but
+only the live Team owner/admin may apply its card. An external admin roster,
+OAuth credential, or Agent `role:*` grant does not replace that host-side gate.
 
 ## Install
 
