@@ -1,0 +1,76 @@
+{
+  "name": "@nia-teams/mcp-sdk",
+  "version": "0.1.0",
+  "description": "Nia Teams authentication, confirmation cards, and workspace helpers for official MCP SDKs",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nia Teams",
+  "homepage": "https://nia-teams.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nia-teams/mcp-sdk.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs",
+    "examples/*.ts",
+    "examples/workspace-ui/*.ts",
+    "examples/workspace-ui/*.html",
+    "examples/workspace-ui/package.json",
+    "examples/workspace-ui/tsconfig.json",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./auth": {
+      "types": "./dist/auth/index.d.ts",
+      "import": "./dist/auth/index.js"
+    },
+    "./cards": {
+      "types": "./dist/cards/index.d.ts",
+      "import": "./dist/cards/index.js"
+    },
+    "./apps": {
+      "types": "./dist/apps/index.d.ts",
+      "import": "./dist/apps/index.js"
+    },
+    "./apps/client": {
+      "types": "./dist/apps/client.d.ts",
+      "import": "./dist/apps/client.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.check.json",
+    "build": "tsc",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "jose": "^6.2.4"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "zod": "^4.6.7"
+  }
+}
