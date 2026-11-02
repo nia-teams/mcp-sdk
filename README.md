@@ -2,137 +2,86 @@
 
 English | [简体中文](./README_CN.md)
 
-Connect enterprise services (databases, logs, deployment pipelines, approvals, and admin consoles) to [Nia Teams](https://nia-teams.com) over MCP.
+Connect internal logs, databases, deployment pipelines, or admin consoles to [Nia Teams](https://nia-teams.com) Agents over MCP.
 
-Before jumping into code, this guide first explains **what these capabilities are inside Nia Teams**, **what comes from standard MCP vs. what Nia Teams extends**, and **what the OIDC tokens actually look like on the wire**.
+## What is Nia Teams
 
----
+Nia Teams is a workspace where humans and AI Agents work together in the same group chats. Each Agent has its own members with three roles: `owner`, `admin`, and `member`. Mention an Agent in chat and it queries data, writes code, or updates configurations.
 
-## 1. Background: How Nia Teams Extends MCP
+What an Agent can do depends on the tools mounted on it. Tools connect over MCP: wrap your internal log service, database, or deployment system as an MCP server and mount it onto the Agent.
 
-In Nia Teams, humans and AI Agents work together inside shared GroupChats. When you mount an MCP server onto an Agent, your server participates in three core Nia Teams product primitives beyond plain tool calls:
+Standard MCP only covers "AI calls a tool." Putting an Agent into a multi-person group chat brings up three extra problems:
 
-### 1.1 Workload OIDC Authentication (Zero Static API Keys)
+- How does your server know which Agent is calling and what data it is allowed to see?
+- For operations like restarting production or mutating a database, how do you make sure a human approved it before it runs?
+- When a dashboard or form works better than chat messages, where does the UI live?
 
-In typical setups, connecting an external service to an Agent requires generating a static API key, pasting it into Agent settings, and rotating it manually.
+Nia Teams has a built-in answer for each of the three. This SDK wires them up on your server.
 
-Nia Teams includes a built-in **Workload OIDC issuer** (`https://nia-teams.com`):
-- As long as you leave custom `Authorization` headers empty when mounting your MCP server, **every HTTP request** Nia Teams sends to your `/mcp` endpoint automatically carries a short-lived RS256 Bearer JWT (`Authorization: Bearer <JWT>`, 5-minute TTL, refreshed 30 seconds before expiry).
-- Your server stores zero shared secrets. It verifies the JWT against Nia Teams' public JWKS (`https://nia-teams.com/oauth2/jwks`) and reads which Agent is calling, which organization (`org:*`) it belongs to, and which platform roles (`role:*`) it holds.
+[Screenshot: A group chat showing the TaskBar, the right sidebar, and the top Apps menu]
 
-#### What do the OIDC tokens look like?
+### 1. Identity: No Static API Keys
 
-Nia Teams signs **two kinds** of RS256 JWTs under the same issuer and JWKS (distinguished by `principal_type` and where they are carried):
+Every time an Agent calls your server, the HTTP request carries a token signed by Nia Teams stating which Agent is calling, which organization it belongs to, and which roles it holds. Your server verifies it against Nia Teams' public keys — no per-Agent API keys to issue or rotate.
 
-**(1) Outer HTTP `Authorization: Bearer <JWT>` — When an Agent calls a tool or opens a Workspace App (`principal_type: "workload"`)**
+Tokens expire in 5 minutes and Nia Teams refreshes them automatically.
 
-```json
-{
-  "iss": "https://nia-teams.com",
-  "aud": "nia-teams-workload",
-  "sub": "ops-agent",
-  "principal_type": "workload",
-  "groups": [
-    "team:ops-agent",
-    "org:acme",
-    "role:ops.reader"
-  ],
-  "iat": 1790812800,
-  "nbf": 1790812800,
-  "exp": 1790813100,
-  "jti": "c9f7e120-531b-45c4-98d4-9ef8a3a01234"
-}
-```
-- `sub`: The calling **Agent's slug** (identifies the Agent workload, not a human in chat).
-- `groups`: The Agent's team (`team:<slug>`), organization (`org:<slug>`), and platform-assigned `AuthorizationRole`s (`role:<roleKey>`, plus `nia:elevated:role:<roleKey>` when a human has approved temporary session elevation).
+### 2. TaskBar: Nothing Runs Until a Human Clicks
 
-**(2) Inner MCP `_meta["nia/confirmationToken"]` — When a human clicks Confirm on a TaskBar card and Nia Teams invokes the execution tool (`principal_type: "service"`)**
+The TaskBar is the strip right above the chat input box where pending action cards sit waiting for a human.
 
-On card-confirmation callbacks, the outer HTTP Bearer token identifies the platform callback service (`sub: "nia-teams-platform"`, `principal_type: "service"`), while MCP `params._meta["nia/confirmationToken"]` carries a signed JWT locked to the exact human click and tool arguments:
+[Screenshot: A confirmation card for "Restart payments-api" sitting in the TaskBar]
 
-```json
-{
-  "iss": "https://nia-teams.com",
-  "aud": "nia-teams-workload",
-  "sub": "nia-teams-platform",
-  "principal_type": "service",
-  "human_confirmed": true,
-  "confirmed_by": "65f000000000000000000001",
-  "confirmed_by_name": "Alice",
-  "confirmation_card_id": "restart:payments-api:v3",
-  "context_server": "ops",
-  "context_tool": "execute_restart",
-  "context_arguments_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-  "iat": 1790812860,
-  "nbf": 1790812860,
-  "exp": 1790813160,
-  "jti": "38a1b544-89ef-4a0e-b8c1-7640219c5511"
-}
-```
-- `confirmed_by` / `confirmed_by_name`: The 24-character hex Nia Teams user ID and display name of the human who clicked the button.
-- `context_server` / `context_tool` / `context_arguments_sha256`: Cryptographically binds the token to the target mount name, tool name, and canonical JSON SHA-256 digest of the arguments — if any argument is modified, verification fails with `403`.
+Write operations work in two steps: the AI only proposes. It calls your proposal tool, which posts a card to the TaskBar explaining what it wants to do and why. Nothing has changed yet.
 
----
+When an authorized person in the chat clicks Confirm, Nia Teams calls your execution tool and attaches a signed token recording who clicked, which card they clicked, and a hash of the arguments. If a single field in the arguments was altered, the token no longer matches and your server rejects the call.
 
-### 1.2 What is the TaskBar (Human Confirmation Cards)?
+### 3. Right Sidebar: Give the Agent a Console
 
-In every Nia Teams GroupChat, directly **below the message timeline and above the composer / Agent execution bar**, sits a persistent action strip called the **TaskBar**.
+The official [MCP App](https://github.com/modelcontextprotocol/ext-apps) extension lets a tool attach a web UI. Most clients render that UI inside a chat message bubble, where it scrolls out of view a few messages later.
 
-The TaskBar is Nia Teams' **human-in-the-loop gate for write operations**:
-- When an Agent wants to perform a state-changing or destructive action (restarting a production service, running a database migration, merging an MR, changing permissions), it does not execute the mutation directly. Instead, it calls a **proposal tool** that returns a structured confirmation card (`_niaCard: true`).
-- Nia Teams renders that card in the GroupChat's TaskBar (and increments the chat's unread action badge), showing the title, description, optional detail view, and a **Confirm** button (optionally requiring external OAuth such as GitLab or GitHub via `requiresIdentity`).
-- **Nothing mutates while the card is pending.** Only after an authorized human clicks the button in the TaskBar does Nia Teams mint the `nia/confirmationToken` above, invoke your **execution tool** (or signed webhook), and transition the card to running / succeeded / failed.
+Nia Teams opens it in a dedicated pane on the right side of the chat: keep talking on the left while watching metrics or reviewing tickets on the right. You can also pin it to the Apps menu at the top of the chat so anyone in the group can open it directly without asking the AI.
 
----
+[Screenshot: An operations console open in the right sidebar]
 
-### 1.3 What is an MCP App & the Right-Sidebar Console (Workspace App)?
+On every request from that pane, Nia Teams tells your server which user is interacting and whether they are an `owner`, `admin`, or `member` of the Agent. You can also hide admin consoles from regular members entirely.
 
-The official MCP extension [`@modelcontextprotocol/ext-apps`](https://github.com/modelcontextprotocol/ext-apps) (SEP-1865) defines **MCP Apps**: an MCP server can serve an HTML application at a `ui://` resource URI (`text/html;profile=mcp-app`), and the iframe talks back to the MCP server over `postMessage` using `app.callServerTool(...)`.
+### Standard MCP vs. Nia Teams Additions
 
-In generic MCP clients, an MCP App renders as a small inline card inside a single chat message bubble and scrolls out of view. **Nia Teams extends standard MCP Apps into a persistent Right-Sidebar Console (Workspace App)**:
-- **Desktop right-hand split pane / mobile full-screen sheet**: When a tool sets `_meta["nia/workspace"]: true`, opening the MCP App docks it in the **right-hand split workspace** alongside the chat — so your team can inspect dashboards, review queues, or edit configurations on the right while continuing to talk with colleagues and Agents on the left.
-- **GroupChat top "Apps" menu entrypoint**: Setting `threadEntrypoint: true` adds the console directly to the **Apps** dropdown in the GroupChat header. Humans can open the console with one click at any time without asking the AI to invoke a tool first.
-- **Live viewer role injection**: Whenever a human opens the sidebar console or triggers a request from it, Nia Teams resolves that human's live role on the Agent (`owner`, `admin`, or `member`) and injects it into the tool call's `_meta.boundContext`, and can hide admin-only consoles from regular members (`requireTeamAdmin: true`).
-
----
-
-### 1.4 Standard MCP vs. Nia Teams Extensions at a Glance
-
-`@nia-teams/mcp-sdk` is a thin layer on top of [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) and [`@modelcontextprotocol/ext-apps`](https://github.com/modelcontextprotocol/ext-apps). Standard MCP handles transport and UI bridging; this package adds the Nia Teams extensions in the right column:
-
-| Capability | Standard MCP (`@modelcontextprotocol/sdk` & `ext-apps`) | Nia Teams Extension (`@nia-teams/mcp-sdk`) |
+| | Standard MCP | Added by Nia Teams |
 | --- | --- | --- |
-| **Transport & Core Primitives** | JSON-RPC 2.0, `StreamableHTTPServerTransport`, `McpServer.registerTool` / `registerResource`, `CallToolResult` | No custom wrapper needed — 100% native `@modelcontextprotocol/sdk` |
-| **Identity & Auth (`/auth`)** | Leaves HTTP headers and JSON-RPC `_meta` open to host implementations | • Automatic outbound Workload OIDC RS256 JWTs (`iss=https://nia-teams.com`) + `createWorkloadOidcVerifier`<br>• Signed `_meta["nia/confirmationToken"]` / `_meta["nia/viewerContextToken"]` + `canonicalJsonSha256` argument binding |
-| **TaskBar Confirm Cards (`/cards`)** | Standard `CallToolResult.structuredContent` container | • `structuredContent: { _niaCard: true, card }` TaskBar card schema<br>• Two-step proposal + execution tool callbacks, external OAuth binding (`requiresIdentity`), and `X-Nia-Signature` webhook HMAC helpers |
-| **Sidebar Workspace Apps (`/apps`, `/apps/client`)** | `ui://` HTML resources (`text/html;profile=mcp-app`), `registerAppTool` / `registerAppResource`, browser `App` & `PostMessageTransport` | • Right-sidebar split workspace docking (`_meta["nia/workspace"]`) & GroupChat header **Apps** menu entry (`threadEntrypoint`)<br>• Admin-only visibility (`_meta["nia/requireTeamAdmin"]`) & live viewer role verification (`verifyBoundViewer`)<br>• Browser `createMcpAppFetch` (`fetch('/api/...')` → `app.callServerTool`) & server `createSafeApiPathChecker` route allowlist |
+| Tool calls & transport | Everything | Unchanged |
+| Identity | Leaves headers and `_meta` open | Agent token, human confirmation token |
+| Confirmation cards | Tools can return structured data | Rendered in TaskBar, calls execution tool on click |
+| UI | MCP App (tool-attached web page) | Right sidebar, Apps menu entry, live viewer role |
+
+Transport and UI bridging use the official `@modelcontextprotocol/sdk` and `@modelcontextprotocol/ext-apps` packages; this SDK implements the right-hand column.
 
 ---
 
-## 2. Installation & Package Entrypoints
+## Install
 
-Requires **Node.js 20+** (ESM + TypeScript declarations).
+Requires Node.js 20+.
 
 ```sh
 npm install @nia-teams/mcp-sdk @modelcontextprotocol/sdk @modelcontextprotocol/ext-apps zod
 ```
 
-| Import path | Environment | Purpose |
+| Subpath | Environment | Purpose |
 | --- | --- | --- |
-| `@nia-teams/mcp-sdk/auth` | Node.js | Verify HTTP Bearer JWTs, human confirmation/viewer tokens, and canonical JSON digests |
-| `@nia-teams/mcp-sdk/cards` | Node.js | Build TaskBar confirmation cards (`_niaCard`), action results, and webhook HMAC signatures |
-| `@nia-teams/mcp-sdk/apps` | Node.js | Register right-sidebar Workspace Apps (`ui://`), validate viewer roles (`verifyBoundViewer`) and safe API paths |
-| `@nia-teams/mcp-sdk/apps/client` | Browser | Official `App` / `PostMessageTransport` re-exports + `createMcpAppFetch` REST-to-MCP adapter |
-| `@nia-teams/mcp-sdk/testing` | Node.js (Dev) | In-memory OIDC provider, test RSA key generator, and human token signers for Vitest |
-| `@nia-teams/mcp-sdk` | Node.js | Server-side barrel re-exporting `auth`, `cards`, `apps`, and `testing` |
+| `@nia-teams/mcp-sdk/auth` | Node.js | Verify HTTP Bearer tokens, human confirmation tokens, and argument digests |
+| `@nia-teams/mcp-sdk/cards` | Node.js | Build TaskBar cards, return execution status, verify webhook signatures |
+| `@nia-teams/mcp-sdk/apps` | Node.js | Register right-sidebar apps, check viewer roles, allowlist API paths |
+| `@nia-teams/mcp-sdk/apps/client` | Browser | `App` and `createMcpAppFetch` for calling server tools from browser UI code |
+| `@nia-teams/mcp-sdk/testing` | Node.js (test) | Mint local test tokens without connecting to Nia Teams |
 
 ---
 
-## 3. Quickstart: Build & Mount in 5 Minutes
+## Quickstart
 
-### Step 1: Verify OIDC and expose a read-only tool
+### 1. Start a Read-Only Server with Token Verification
 
-Create an HTTP `/mcp` endpoint using the official `StreamableHTTPServerTransport` and verify the caller's Bearer JWT before dispatching MCP requests:
+Expose `/mcp` with the official `StreamableHTTPServerTransport` and verify the `Authorization` header before handling requests:
 
 ```ts
 import { createServer } from "node:http";
@@ -141,7 +90,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { createWorkloadOidcVerifier, WorkloadOidcError } from "@nia-teams/mcp-sdk/auth";
 
-const auth = createWorkloadOidcVerifier(); // Defaults: iss=https://nia-teams.com, aud=nia-teams-workload
+const auth = createWorkloadOidcVerifier();
 
 createServer(async (req, res) => {
   if (req.url !== "/mcp" || req.method !== "POST") {
@@ -152,9 +101,8 @@ createServer(async (req, res) => {
   let server: McpServer | undefined;
   let transport: StreamableHTTPServerTransport | undefined;
   try {
-    // 1. Authenticate caller at the HTTP boundary:
-    //    - Normal Agent calls carry principal_type="workload" and sub="<agentSlug>"
-    //    - Platform TaskBar card callbacks carry principal_type="service" and sub="nia-teams-platform"
+    // Verify the Bearer token:
+    // Agent calls have principalType "workload"; TaskBar card callbacks have "service"
     const identity = await auth.verifyBearerHeader(req.headers.authorization, {
       allowServicePrincipal: true,
     });
@@ -172,7 +120,7 @@ createServer(async (req, res) => {
       },
       async ({ service, limit }) => {
         if (identity.principalType !== "workload" || !identity.roles.includes("ops.reader")) {
-          throw new WorkloadOidcError(403, "Agent requires role:ops.reader");
+          throw new WorkloadOidcError(403, "Requires role:ops.reader");
         }
         const rows = await queryLogsFromDb({ orgs: identity.orgs, service, limit });
         return {
@@ -199,28 +147,21 @@ createServer(async (req, res) => {
 }).listen(3000);
 ```
 
-### Step 2: Mount your server onto a Nia Teams Agent
+### 2. Mount It onto an Agent
 
-Deploy your server to an HTTPS URL reachable from Nia Teams (for example, `https://ops.acme.com/mcp`), then open a chat with your Agent and say:
+Deploy the server to a public HTTPS URL (such as `https://ops.acme.com/mcp`; loopback and private IPs are blocked), then tell your Agent in chat:
 
 > Connect MCP server `ops` at `https://ops.acme.com/mcp`
 
-What happens next:
+The Agent posts a configuration card to the TaskBar. Once an `owner` or `admin` of that Agent clicks Confirm, the server is mounted (you can also add it under Agent Settings → MCP).
 
-1. The Agent calls its built-in `mcp_servers` tool (`action: "update"`, `upsert: [{ name: "ops", url: "https://ops.acme.com/mcp" }]`), which posts a **confirmation card** in the TaskBar.
-2. An **owner** or **admin** of that Agent clicks **Confirm** on the card (or adds it in **Agent Settings → MCP**).
-3. Leave custom `Authorization` headers empty — Nia Teams automatically attaches a fresh RS256 Bearer JWT on every HTTP request (setting a static `Authorization` header disables automatic OIDC injection).
-4. Your tools appear to the Agent as `mcp__ops__<toolName>` (for example, `mcp__ops__query_service_logs`), while your server registers plain names (`query_service_logs`).
-
-> **Mount scopes & network rules**
-> - **Three mount levels**: **Agent mount** (applies to all chats of that Agent), **Routine mount** (`routine.mcpServers`, isolated to sessions triggered by that Routine), and **Blueprint built-in** (platform-managed and locked).
-> - **SSRF protection**: Custom URLs must be `https://` (or `http://`) and cannot target `localhost`, loopback (`127.0.0.0/8`), private RFC1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), or `.local` / `.internal` hostnames.
+Leave custom `Authorization` headers empty when mounting so Nia Teams attaches its OIDC token automatically. A tool registered as `query_service_logs` on your server appears to the Agent as `mcp__ops__query_service_logs`.
 
 ---
 
-## 4. Pattern 1: Human-Confirmed Writes (TaskBar Cards)
+## TaskBar Confirmation Cards
 
-Model every destructive or state-changing operation as two tools: a **proposal tool** (called by the AI, emits a TaskBar card, mutates nothing) and an **execution tool** (called by Nia Teams only after a human clicks **Confirm**).
+Split any write operation into two tools: `propose_restart` for the AI to post a card without touching production, and `execute_restart` for Nia Teams to call after a human clicks Confirm.
 
 ```ts
 import { z } from "zod";
@@ -231,25 +172,24 @@ import {
   cardActionError,
 } from "@nia-teams/mcp-sdk/cards";
 
-// 1. AI calls this tool -> emits a confirmation card in the GroupChat TaskBar
+// 1. Proposal tool: called by the AI, posts a card to the TaskBar
 server.registerTool(
   "propose_restart",
   {
-    description: "Propose restarting a production service (emits a TaskBar confirmation card)",
+    description: "Propose restarting a production service and wait for human confirmation",
     inputSchema: { service: z.string(), reason: z.string(), expectedVersion: z.number().int() },
   },
   async (args) => {
     await db.savePendingRestart(args);
     return cardToolResult(
-      `Confirmation card created to restart ${args.service}. Waiting for human approval.`,
+      `Created confirmation card to restart ${args.service}.`,
       createMcpConfirmCard({
         cardId: `restart:${args.service}:v${args.expectedVersion}`,
         title: `Restart ${args.service}`,
         subtitle: `v${args.expectedVersion}`,
         description: args.reason,
         actionLabel: "Confirm Restart",
-        // `server` MUST match the mount name configured on the Agent (e.g. "ops")
-        server: "ops",
+        server: "ops", // Mount name configured on the Agent
         toolName: "execute_restart",
         arguments: args,
       }),
@@ -257,7 +197,7 @@ server.registerTool(
   },
 );
 
-// 2. Nia Teams calls this tool ONLY after a human clicks "Confirm Restart" in the TaskBar
+// 2. Execution tool: called by Nia Teams after a human clicks "Confirm Restart"
 server.registerTool(
   "execute_restart",
   {
@@ -265,9 +205,7 @@ server.registerTool(
     annotations: { destructiveHint: true },
   },
   async (args, extra) => {
-    // Cryptographically verifies:
-    // - Signed by Nia Teams (`sub: "nia-teams-platform"`, <= 5 min lifetime)
-    // - Locked to server="ops", tool="execute_restart", cardId, and canonicalJsonSha256(args)
+    // Verify the platform signature, server name, tool name, cardId, and argument hash
     const human = await auth.verifyHumanActionContext(extra._meta, {
       server: "ops",
       tool: "execute_restart",
@@ -275,21 +213,21 @@ server.registerTool(
       expectedCardId: `restart:${args.service}:v${args.expectedVersion}`,
     });
 
-    // Check business permissions for the clicking user (`human.confirmedBy` is a 24-hex Nia Teams userId)
+    // human.confirmedBy is the clicker's 24-character hex Nia Teams user ID
     if (!(await db.canUserRestartService(human.confirmedBy, args.service))) {
-      return cardActionError("Only service owners can approve production restarts", {
+      return cardActionError("Only service owners can restart production instances", {
         errorKind: "auth_forbidden",
       });
     }
 
-    // Apply atomically with a database CAS / version check so replays or double-clicks are rejected
+    // Use a database version check so double-clicks or replays are rejected
     const applied = await db.applyRestartCas(args.service, args.expectedVersion, {
       approvedBy: human.confirmedBy,
       approvedByName: human.confirmedByName,
       jti: human.jti,
     });
     if (!applied) {
-      return cardActionError("Restart already executed or version changed");
+      return cardActionError("Already executed or version changed");
     }
 
     return cardActionSuccess({
@@ -300,17 +238,15 @@ server.registerTool(
 );
 ```
 
-Need an async HTTP webhook instead of an MCP execution tool? Use `createWebhookConfirmCard({ title, url, mcpServerName: "ops", pendingInput })`. If you configure `webhookSecret` on the mount, verify `req.headers["x-nia-signature"]` against the raw request body bytes with `verifyCardSignature(secret, rawBodyBuffer, header)`. If no `webhookSecret` is set and the webhook shares the MCP server's origin, Nia Teams signs a Bearer JWT with `human_confirmed: true` and `confirmed_by: "<userId>"`.
+To trigger an HTTP webhook on click instead of an MCP tool, use `createWebhookConfirmCard({ title, url, mcpServerName: "ops", pendingInput })` and verify `req.headers["x-nia-signature"]` against the raw request body with `verifyCardSignature(secret, rawBodyBuffer, header)`.
 
 ---
 
-## 5. Pattern 2: Right-Sidebar Console (Workspace App)
+## Right-Sidebar Pages
 
-To open an interactive console (dashboards, review queues, config editors) in the right-hand split pane of Nia Teams, bundle your frontend as a single HTML file and register it with `registerNiaWorkspaceApp`. The browser iframe never handles tokens or secrets.
+Bundle your frontend into a single HTML file with `vite-plugin-singlefile` and register it with `registerNiaWorkspaceApp`. The browser page does not handle any tokens.
 
-### 1. Bundle your frontend as a single HTML file
-
-Use Vite + `vite-plugin-singlefile` so all JS and CSS inline cleanly into one `ui://` HTML resource:
+### 1. Frontend
 
 ```ts
 // ui/vite.config.ts
@@ -322,7 +258,7 @@ export default defineConfig({
 });
 ```
 
-In your browser code, import `@nia-teams/mcp-sdk/apps/client` (never import the Node server barrel in browser bundles):
+Import from `@nia-teams/mcp-sdk/apps/client` in browser code:
 
 ```ts
 // ui/src/main.ts
@@ -331,14 +267,12 @@ import { App, createMcpAppFetch } from "@nia-teams/mcp-sdk/apps/client";
 const app = new App({ name: "Ops Console", version: "1.0.0" });
 const apiFetch = createMcpAppFetch({ app, apiToolName: "ops_console_api" });
 
-// Lazily connects `app` on first request and forwards GET & POST JSON endpoints over MCP postMessage
+// Works like regular fetch; calls ops_console_api on your MCP server over postMessage
 const res = await apiFetch("/api/incidents?status=open");
 const { incidents } = await res.json();
 ```
 
-You can also use `@modelcontextprotocol/ext-apps/react` (`useApp`, `useHostStyleVariables`, `useDocumentTheme`) directly in React apps to match Nia Teams' light/dark theme variables.
-
-### 2. Register the Workspace App and API bridge on your MCP server
+### 2. Server Registration
 
 ```ts
 import { readFile } from "node:fs/promises";
@@ -356,8 +290,8 @@ const isAllowedRoute = createSafeApiPathChecker({
 registerNiaWorkspaceApp(server, {
   resourceUri: "ui://ops/console",
   html: () => readFile(new URL("../ui/dist/index.html", import.meta.url), "utf8"),
-  threadEntrypoint: true,   // Show in the group chat's top "Apps" menu
-  requireTeamAdmin: true,   // Hide from regular members; only Agent owner/admin can open
+  threadEntrypoint: true, // List in the group chat's top Apps menu
+  requireTeamAdmin: true, // Visible only to the Agent's owner and admin
   visibility: ["app"],
   entryTool: {
     name: "open_ops_console",
@@ -370,7 +304,6 @@ registerNiaWorkspaceApp(server, {
   apiTool: {
     name: "ops_console_api",
     handler: async ({ method, path, body }, extra) => {
-      // Verify the live human viewer's role on EVERY call (`owner` or `admin` here)
       const viewer = verifyBoundViewer(extra._meta, { requireTeamAdmin: true });
 
       if (!isAllowedRoute(method, path)) {
@@ -393,26 +326,68 @@ registerNiaWorkspaceApp(server, {
 
 ---
 
-## 6. Permission Reference: Agent, Owner, Admin, and Member
+## Tokens and Permissions
 
-Each Agent in Nia Teams has its own member roster with three roles: **`owner`** (creator or transferred owner), **`admin`** (manages Agent configuration), and **`member`** (uses the Agent and chats).
+Every request has two layers: the outer HTTP `Authorization` header tells you which Agent (or platform service) sent the request, and the inner MCP `_meta` object tells you which human clicked a card or opened a page.
 
-Keep the two layers distinct: **`role:*` in the outer HTTP JWT is a platform `AuthorizationRole` assigned to the Agent workload, whereas a human's `owner` / `admin` / `member` role is passed inside MCP `_meta`**. Here is how permissions work across every surface:
+### 1. Agent Token in the HTTP Header
 
-| Surface | What Nia Teams enforces automatically | What your MCP server receives & enforces |
-| --- | --- | --- |
-| **Mounting an MCP server** (`mcp_servers`) | Anyone in chat can ask the Agent to propose a mount; **only the Agent's `owner` or `admin`** can click Confirm on the mount card. | N/A (handled by Nia Teams before connecting). |
-| **AI calling a read / proposal tool** | Injects the Agent's workload JWT (`sub: "<agentSlug>"`, `groups`). | Check `identity.subject`, `identity.orgs`, and `identity.roles` via `verifyBearerHeader`. |
-| **Human clicking a TaskBar Confirm Card** | By default, checks that the clicker is a member (`owner`, `admin`, or `member`) of the Agent that emitted the card. If the card sets `requiresIdentity: { provider }`, skips the Agent-member check, resolves the clicker's external OAuth token, and passes `_meta["nia/identityToken"]`. | Call `verifyHumanActionContext(extra._meta, ...)`:<br>• **Any Agent member**: valid token is sufficient if you have no narrower ACL.<br>• **Specific admins / owners on custom mounts**: check `human.confirmedBy` (24-hex Nia userId) against your enterprise ACL/roster, or verify `human.identityToken` against the upstream provider (e.g. GitHub/GitLab). *(Note: `human.sourceTeam?.role` is only populated on platform role-managed approval cards, not generic custom mounts.)* |
-| **Human opening & using a Workspace App** | Requires the user to be in **both** the GroupChat and the Agent's member list. Setting `requireTeamAdmin: true` hides the App from `member` in the top Apps menu and blocks `/apps/open` with 403. | On authenticated Agent mounts, Nia Teams injects live `_meta.boundContext = { viewerUserId, viewerTeamRole }`:<br>• **Allow `owner` / `admin` / `member`**: `const v = verifyBoundViewer(extra._meta)`<br>• **Allow `owner` / `admin` only**: `const v = verifyBoundViewer(extra._meta, { requireTeamAdmin: true })`<br>• **Allow `owner` only**: check `if (v.viewerTeamRole !== "owner") throw new WorkloadOidcError(403, "Owner required")` |
+`verifyBearerHeader` decodes an RS256 JWT with these claims:
 
-> **Security note on `_meta.boundContext`**: Unlike `nia/confirmationToken` (which is a signed JWT), `boundContext` is a plain JSON object injected by Nia Teams over the authenticated MCP connection. Only trust `verifyBoundViewer(extra._meta)` **after** `verifyBearerHeader` has authenticated the Nia Teams workload JWT for your expected Agent `allowedSubjects` / `requiredGroups`.
+```json
+{
+  "iss": "https://nia-teams.com",
+  "aud": "nia-teams-workload",
+  "sub": "ops-agent",
+  "principal_type": "workload",
+  "groups": ["team:ops-agent", "org:acme", "role:ops.reader"],
+  "iat": 1790812800,
+  "exp": 1790813100
+}
+```
+
+- `identity.subject` (`sub`): The Agent's slug (e.g. `"ops-agent"`). When a human clicks a TaskBar card, Nia Teams calls your server using its platform identity instead: `sub: "nia-teams-platform"`, `principal_type: "service"`.
+- `identity.orgs` / `identity.teams` / `identity.roles`: Arrays parsed from `groups`. Note that `role:*` is a machine role assigned to the Agent, not a human's `owner` / `admin` / `member` role.
+
+### 2. Human Confirmation Token on Card Clicks
+
+When a human clicks Confirm in the TaskBar, Nia Teams places this signed token in `extra._meta["nia/confirmationToken"]`:
+
+```json
+{
+  "iss": "https://nia-teams.com",
+  "aud": "nia-teams-workload",
+  "sub": "nia-teams-platform",
+  "principal_type": "service",
+  "human_confirmed": true,
+  "confirmed_by": "65f000000000000000000001",
+  "confirmed_by_name": "Alice",
+  "confirmation_card_id": "restart:payments-api:v3",
+  "context_server": "ops",
+  "context_tool": "execute_restart",
+  "context_arguments_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "iat": 1790812860,
+  "exp": 1790813160,
+  "jti": "38a1b544-89ef-4a0e-b8c1-7640219c5511"
+}
+```
+
+`verifyHumanActionContext` checks the signature, 5-minute lifetime, server name, tool name, `cardId`, and argument hash, then returns `confirmedBy` (user ID) and `confirmedByName`.
+
+### 3. Checking Human `owner` / `admin` / `member` Roles
+
+- **Mounting an MCP server**: Anyone in chat can ask the Agent to propose a mount, but only the Agent's `owner` or `admin` can click Confirm on the mount card.
+- **Clicking a TaskBar card**: By default, Nia Teams checks that the clicker is a member of the Agent (`owner`, `admin`, or `member`). To restrict an action to specific people, check `human.confirmedBy` against your own permission table, or set `requiresIdentity: { provider: "gitlab" }` on the card so Nia Teams passes the clicker's external OAuth token in `human.identityToken`. (Note: `human.sourceTeam?.role` is only present on built-in platform approval flows, not custom mounts.)
+- **Using a right-sidebar page**: On every `entryTool` and `apiTool` call, Nia Teams sets `extra._meta.boundContext` with the live viewer's role. Authenticate the outer HTTP request with `verifyBearerHeader` (and restrict `allowedSubjects` / `requiredGroups`) first, then check the viewer with `verifyBoundViewer`:
+  - Allow `owner`, `admin`, and `member`: `verifyBoundViewer(extra._meta)`
+  - Allow `owner` and `admin` only: `verifyBoundViewer(extra._meta, { requireTeamAdmin: true })`
+  - Allow `owner` only: check `if (viewer.viewerTeamRole !== "owner") throw new WorkloadOidcError(403, "Owner required")`
 
 ---
 
-## 7. Testing Locally (Zero Cloud Dependencies)
+## Local Unit Tests
 
-You do not need a live Nia Teams environment to test your server. `@nia-teams/mcp-sdk/testing` ships an in-memory RS256 OIDC provider and token signers that pair with the official `InMemoryTransport`:
+`@nia-teams/mcp-sdk/testing` mints tokens in memory so you can run tests in Vitest without a live Nia Teams environment:
 
 ```ts
 import { expect, test } from "vitest";
@@ -423,7 +398,7 @@ import {
   signTestConfirmationToken,
 } from "@nia-teams/mcp-sdk/testing";
 
-test("verifies workload JWT and human confirmation token offline", async () => {
+test("verifies Agent token and human confirmation token offline", async () => {
   const provider = createWorkloadOidcProvider({
     issuer: "https://nia-teams.com",
     audience: "nia-teams-workload",
@@ -433,7 +408,6 @@ test("verifies workload JWT and human confirmation token offline", async () => {
 
   const auth = createWorkloadOidcVerifier({ jwks: await provider.getJwks() });
 
-  // 1. Simulate an Agent workload call
   const agentJwt = await provider.signIdToken({
     subject: "ops-agent",
     groups: ["team:ops-agent", "org:acme", "role:ops.reader"],
@@ -444,7 +418,6 @@ test("verifies workload JWT and human confirmation token offline", async () => {
   });
   expect(identity.subject).toBe("ops-agent");
 
-  // 2. Simulate a human clicking Confirm on a TaskBar card
   const args = { service: "payments-api", expectedVersion: 3 };
   const confirmationToken = await signTestConfirmationToken(provider, {
     server: "ops",
@@ -465,14 +438,14 @@ test("verifies workload JWT and human confirmation token offline", async () => {
 
 ---
 
-## 8. Examples & References
+## Examples and Docs
 
-- **Runnable examples**:
-  - [`examples/01-readonly-workload-oidc.ts`](./examples/01-readonly-workload-oidc.ts) — Streamable HTTP `/mcp` server with OIDC auth and scoped read queries
-  - [`examples/02-taskbar-confirm-card.ts`](./examples/02-taskbar-confirm-card.ts) — Two-step proposal + human-confirmed write with version CAS
-  - [`examples/03-workspace-mcp-app.ts`](./examples/03-workspace-mcp-app.ts) & [`examples/workspace-ui/`](./examples/workspace-ui) — Right-sidebar Workspace App + Vite single-file frontend
-- **AI coding guide**: [`AGENTS.md`](./AGENTS.md) — Drop-in context for AI coding agents building or reviewing Nia Teams MCP servers
-- **Wire protocol**: [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md) — Exact JWT claims, canonical JSON rules, `_niaCard` schemas, and security invariants
+- Runnable examples:
+  - [`examples/01-readonly-workload-oidc.ts`](./examples/01-readonly-workload-oidc.ts) — Read-only log query server
+  - [`examples/02-taskbar-confirm-card.ts`](./examples/02-taskbar-confirm-card.ts) — TaskBar confirmation cards and execution callback
+  - [`examples/03-workspace-mcp-app.ts`](./examples/03-workspace-mcp-app.ts) & [`examples/workspace-ui/`](./examples/workspace-ui) — Right-sidebar console and Vite frontend
+- AI coding guide: [`AGENTS.md`](./AGENTS.md)
+- Wire specification: [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)
 
 ## License
 
