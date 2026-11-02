@@ -87,8 +87,11 @@ createServer(async (req, res) => {
     await transport.handleRequest(req, res);
   } catch (err) {
     if (!res.headersSent) {
-      const status = err instanceof WorkloadOidcError ? err.statusCode : 500;
-      res.writeHead(status, { "WWW-Authenticate": "Bearer" }).end("Unauthorized");
+      if (err instanceof WorkloadOidcError) {
+        res.writeHead(err.statusCode, { "WWW-Authenticate": "Bearer" }).end(err.message);
+      } else {
+        res.writeHead(500).end("Internal Server Error");
+      }
     }
   } finally {
     await transport?.close();
@@ -176,7 +179,7 @@ server.registerTool(
       expectedCardId: `restart:${args.service}:v${args.expectedVersion}`,
     });
 
-    // 校验点击人（`human.confirmedBy` 是 24 位 Nia Teams 用户 ID）是否有业务操作权限
+    // 校验点击人（`human.confirmedBy` 是 24 位十六进制 Nia Teams 用户 ID）是否有业务操作权限
     if (!(await db.canUserRestartService(human.confirmedBy, args.service))) {
       return cardActionError("只有服务负责人可以批准重启生产实例", {
         errorKind: "auth_forbidden",
@@ -232,7 +235,7 @@ import { App, createMcpAppFetch } from "@nia-teams/mcp-sdk/apps/client";
 const app = new App({ name: "运维控制台", version: "1.0.0" });
 const apiFetch = createMcpAppFetch({ app, apiToolName: "ops_console_api" });
 
-// 像普通 fetch 一样调相对路径 GET/POST JSON 接口，底层自动走官方 postMessage 调 MCP 工具
+// 首次调用自动完成 app.connect() 握手，像普通 fetch 一样调相对路径 GET/POST JSON 接口
 const res = await apiFetch("/api/incidents?status=open");
 const { incidents } = await res.json();
 ```
@@ -328,7 +331,7 @@ Nia Teams 里每个 Agent 都有自己的成员表，分三档角色：**`owner`
 | --- | --- | --- |
 | **挂载 / 修改 MCP 配置**（`mcp_servers`） | 群里普通 `member` 可以让 AI 发起挂载提案，但**只有该 Agent 的 `owner` 或 `admin`** 能点击挂载确认卡生效。 | 无需处理（连接建立前由平台拦截）。 |
 | **AI 调只读 / 提案工具** | 自动注入该 Agent 的 Workload JWT（`sub: "<agentSlug>"`、`groups`）。 | 用 `verifyBearerHeader` 校验 `identity.subject`、`identity.orgs` 和 `identity.roles`，把数据查询限制在该组织/角色范围内。 |
-| **人类点击 TaskBar 确认卡** | • 默认门槛：点击者必须是发出这张卡的 Agent 的成员（`owner`、`admin`、`member` 均可点）。<br>• 若卡片声明 `requiresIdentity: { provider: "gitlab" }`：跳过 Agent 成员门槛（允许跨团队审批），拉取或引导授权点击者的外部 OAuth Token 放入 `_meta["nia/identityToken"]`。 | 调 `verifyHumanActionContext(extra._meta, ...)` 拿到经过签名的点击人 `human.confirmedBy`（24 位用户 ID）：<br>• **允许任意 Agent 成员确认**：验签通过即可。<br>• **限制管理员 / 负责人确认（自定义挂载）**：用 `human.confirmedBy` 查你企业内部的管理员/负责人权限表，或拿 `human.identityToken` 去上游系统（如 GitLab/GitHub）验真实权限。*（注：`human.sourceTeam?.role` 仅在平台内置角色托管审批卡上附带，普通自定义挂载卡不带该字段。）* |
+| **人类点击 TaskBar 确认卡** | • 默认门槛：点击者必须是发出这张卡的 Agent 的成员（`owner`、`admin`、`member` 均可点）。<br>• 若卡片声明 `requiresIdentity: { provider: "gitlab" }`：跳过 Agent 成员门槛（允许跨团队审批），拉取或引导授权点击者的外部 OAuth Token 放入 `_meta["nia/identityToken"]`。 | 调 `verifyHumanActionContext(extra._meta, ...)` 拿到经过签名的点击人 `human.confirmedBy`（24 位十六进制用户 ID）：<br>• **允许任意 Agent 成员确认**：验签通过即可。<br>• **限制管理员 / 负责人确认（自定义挂载）**：用 `human.confirmedBy` 查你企业内部的管理员/负责人权限表，或拿 `human.identityToken` 去上游系统（如 GitLab/GitHub）验真实权限。*（注：`human.sourceTeam?.role` 仅在平台内置角色托管审批卡上附带，普通自定义挂载卡不带该字段。）* |
 | **人类打开并使用右侧 Workspace App** | 要求当前用户**同时在群聊里且是该 Agent 成员**。若注册时设了 `requireTeamAdmin: true`，普通 `member` 在顶部 Apps 菜单里直接看不见该应用，强行调 `/apps/open` 返回 403。 | 在已验签的 Agent 连接上，平台每次调 `entryTool` 和 `apiTool` 都会实时查询并注入 `_meta.boundContext = { viewerUserId, viewerTeamRole }`：<br>• **放行 `owner` + `admin` + `member`**：`const v = verifyBoundViewer(extra._meta)`<br>• **仅放行 `owner` + `admin`**：`const v = verifyBoundViewer(extra._meta, { requireTeamAdmin: true })`<br>• **仅放行 `owner`（高危操作）**：再加一行 `if (v.viewerTeamRole !== "owner") throw new WorkloadOidcError(403, "仅 Agent Owner 可操作")` |
 
 > **关于 `_meta.boundContext` 的信任边界**：和带 RSA 签名的 `nia/confirmationToken` 不同，`boundContext` 是 Nia Teams 宿主在已认证连接上注入的普通 JSON 字段。你的服务端必须**先通过 `verifyBearerHeader` 验证外层 Nia Teams Workload JWT 并限制允许的 Agent `allowedSubjects` / `requiredGroups`**，之后才能信任 `verifyBoundViewer(extra._meta)` 里的角色。

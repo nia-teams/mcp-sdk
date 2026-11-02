@@ -87,8 +87,11 @@ createServer(async (req, res) => {
     await transport.handleRequest(req, res);
   } catch (err) {
     if (!res.headersSent) {
-      const status = err instanceof WorkloadOidcError ? err.statusCode : 500;
-      res.writeHead(status, { "WWW-Authenticate": "Bearer" }).end("Unauthorized");
+      if (err instanceof WorkloadOidcError) {
+        res.writeHead(err.statusCode, { "WWW-Authenticate": "Bearer" }).end(err.message);
+      } else {
+        res.writeHead(500).end("Internal Server Error");
+      }
     }
   } finally {
     await transport?.close();
@@ -232,7 +235,7 @@ import { App, createMcpAppFetch } from "@nia-teams/mcp-sdk/apps/client";
 const app = new App({ name: "Ops Console", version: "1.0.0" });
 const apiFetch = createMcpAppFetch({ app, apiToolName: "ops_console_api" });
 
-// Works like fetch() for relative /api/ GET & POST JSON endpoints over MCP postMessage
+// Lazily connects `app` on first request and forwards GET & POST JSON endpoints over MCP postMessage
 const res = await apiFetch("/api/incidents?status=open");
 const { incidents } = await res.json();
 ```
