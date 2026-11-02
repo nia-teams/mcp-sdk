@@ -27,6 +27,26 @@ describe("canonical JSON", () => {
     a.push(a);
     expect(() => canonicalJson(a)).toThrow("Cyclic");
   });
+  it.each([{ value: [,] }, { value: [1, , 3] }, { value: { nested: [,] } }])(
+    "explicitly rejects sparse arrays, including nested holes: %j",
+    ({ value }) => {
+      const array = Array.isArray(value) ? value : value.nested;
+      expect(
+        Array.from({ length: array.length }, (_, i) => i in array),
+      ).toContain(false);
+      expect(() => canonicalJson(value)).toThrow("Expected a dense JSON array");
+      expect(() => canonicalJsonSha256(value)).toThrow(
+        "Expected a dense JSON array",
+      );
+    },
+  );
+  it("distinguishes a present undefined element from a sparse hole", () => {
+    const array = [undefined];
+    expect(0 in array).toBe(true);
+    expect(() => canonicalJson(array)).toThrow("Expected a JSON value");
+    expect(canonicalJson([])).toBe("[]");
+    expect(canonicalJson([null, false, 0])).toBe("[null,false,0]");
+  });
   it.each([
     undefined,
     NaN,

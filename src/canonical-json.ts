@@ -16,7 +16,12 @@ export function canonicalJson(value: unknown): string {
 
     ancestors.add(item);
     try {
-      if (Array.isArray(item)) return `[${Array.from(item, encode).join(",")}]`;
+      if (Array.isArray(item)) {
+        for (let i = 0; i < item.length; i++) {
+          if (!(i in item)) throw new TypeError("Expected a dense JSON array");
+        }
+        return `[${Array.from(item, encode).join(",")}]`;
+      }
       const prototype = Object.getPrototypeOf(item);
       if (prototype !== Object.prototype && prototype !== null) {
         throw new TypeError("Expected a JSON object");

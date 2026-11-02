@@ -16,6 +16,8 @@
   "files": [
     "dist",
     "README.md",
+    "README_CN.md",
+    "AGENTS.md",
     "docs",
     "examples/*.ts",
     "examples/workspace-ui/*.ts",

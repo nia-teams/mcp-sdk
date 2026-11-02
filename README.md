@@ -1,30 +1,109 @@
+English | [简体中文](./README_CN.md)
+
 # @nia-teams/mcp-sdk
 
-Small, production-compatible Nia Teams extensions for enterprise MCP servers:
-**workload OIDC**, **human-confirmed TaskBar cards**, and **Workspace MCP Apps**.
+**Connect enterprise systems to Nia Teams with verified Agent identity,
+human-confirmed changes, and embedded workspace UIs—without rebuilding MCP.**
 
-Maintained by [Nia Teams](https://nia-teams.com) ·
-[GitHub](https://github.com/nia-teams/mcp-sdk) · [MIT](LICENSE)
+When your enterprise connects databases, logs, deployment pipelines, approval
+workflows, or admin dashboards to [Nia Teams](https://nia-teams.com) through the
+**Model Context Protocol (MCP)**, the official SDKs handle the base protocol:
+`@modelcontextprotocol/sdk` provides JSON-RPC over Streamable HTTP, `tools/call`,
+and `resources/read`; `@modelcontextprotocol/ext-apps` provides standard MCP Apps,
+`ui://` resources, initialization, and iframe postMessage bridging.
 
-## Architecture: official protocols, thin extensions
+**`@nia-teams/mcp-sdk` is the thin Nia Teams extension layer on top of those
+official SDKs.** It adds three enterprise primitives:
+
+1. **Zero-static-secret workload & human-action OIDC** (`/auth`). Agent MCP
+   requests carry an RS256 OIDC Bearer JWT: `iss: https://nia-teams.com`,
+   `aud: nia-teams-workload`, `sub: <agentSlug>`, and groups such as
+   `["team:...", "org:...", "role:..."]`. Verify against `/oauth2/jwks`; no
+   long-lived Agent API keys need to be distributed or rotated. For card clicks,
+   detail views, and supported role-mounted workspace calls, the host attaches
+   a short-lived signed context via `_meta["nia/confirmationToken"]`,
+   `_meta["nia/viewerContextToken"]`, or `_meta["nia/sourceContextToken"]` as
+   appropriate. Its lifetime is at most five minutes, and it binds the exact
+   server, tool name, and canonical SHA-256 argument digest
+   (`context_arguments_sha256`). Platform callback service identities use a
+   distinct subject; they are not human consent on their own.
+2. **Human-in-the-loop TaskBar confirmation cards** (`/cards`). Split a write
+   operation into a proposal and an executor. An AI's proposal call returns a
+   `_niaCard` envelope in `structuredContent` instead of performing the mutation.
+   Nia Teams renders the card in the group chat / TaskBar. Only after an
+   authorized human clicks **Confirm** does the host call the executor with
+   `nia/confirmationToken`, or POST a webhook signed with
+   `X-Nia-Signature` HMAC-SHA256. Your executor still verifies authorization and
+   uses a durable business CAS to prevent repeated side effects.
+3. **Sidebar Workspace MCP Apps** (`/apps` and `/apps/client`). Build on official
+   `ui://` resources with MIME `text/html;profile=mcp-app`. Add
+   `_meta["nia/workspace"]: true` for the desktop right-hand split workspace /
+   mobile full-screen panel, `_meta["openai/ui.entrypoints"]: [{ type: "thread" }]`
+   for the group chat's top Apps menu, and `_meta["nia/requireTeamAdmin"]: true`
+   for admin-only advertisements. Helpers validate `_meta.boundContext` viewer
+   roles and strict API path allowlists. The small `createMcpAppFetch` browser
+   adapter routes existing frontend `fetch('/api/...')`-style calls through
+   official `app.callServerTool()`; the official App owns initialization and
+   postMessage. Metadata alone is not authorization.
+
+Workload authentication needs no static Agent API secret. The optional webhook
+card path **does** use a shared HMAC secret; choose MCP callbacks when you want
+OIDC-based confirmation without that webhook secret.
+
+Maintained by **Nia Teams** · [GitHub](https://github.com/nia-teams/mcp-sdk) ·
+[MIT](LICENSE) · [AI agent guide](./AGENTS.md) · [Protocol specification](./docs/SPECIFICATION.md)
+
+## End-to-end: three flows, one enterprise MCP server
 
 ```text
-Enterprise MCP server
-  @modelcontextprotocol/sdk             server, client, types, transports
-  @modelcontextprotocol/ext-apps/server UI tools and ui:// HTML resources
-  @nia-teams/mcp-sdk                    Nia auth, cards, workspace metadata
-    jose                               RS256 / JWKS verification
+Nia Teams Host                       Enterprise MCP Server           Enterprise systems
+(Agent + authenticated human)        (official MCP SDK + this SDK)
 
-Workspace UI
-  @modelcontextprotocol/ext-apps       App, ui/initialize, postMessage JSON-RPC
-  @nia-teams/mcp-sdk/apps/client        fetch-like JSON REST → tools/call
-  vite-plugin-singlefile               bundle the UI as one HTML resource
+1. READ
+Agent -- tools/call + OIDC Bearer --> verifyBearerHeader + policy ---> scoped database/log query
+      <-- text / structured data --- standard MCP result <----------- result
+
+2. WRITE WITH HUMAN CONFIRMATION
+Agent -- proposal tools/call ------> build _niaCard; NO mutation
+Host  <-- text + _niaCard ---------- cardToolResult
+Human -- Confirm in TaskBar -------> Host authorizes the click
+Host  -- execution tools/call -----> verifyHumanActionContext -------> permissions + durable CAS
+         + confirmationToken        (server/tool/arguments/card)      then apply change
+      <-- action result ----------- cardActionSuccess / cardActionError
+      (Alternative: Host -- raw POST + X-Nia-Signature --> verified webhook)
+
+3. WORKSPACE APP
+Host  -- resources/read ui:// -----> single-file HTML resource
+      <-- text/html;profile=mcp-app
+  |
+  +-- Sandbox Iframe (desktop split workspace / mobile full-screen)
+      official App.connect() <----> Host's official ui/initialize / postMessage bridge
+      createMcpAppFetch('/api/...')
+        -> App.callServerTool() ---> Host -- tools/call -------------> API bridge
+                                           + authenticated context   verifyBoundViewer
+                                                                     + safe path allowlist
+                                                                     + business authorization
+      <--------------------------- { status, body } <--------------- enterprise API result
 ```
 
-This package does **not** implement an MCP server, JWT parser, Apps host, React
-hooks, postMessage protocol, or HTML bundler. Use the official SDKs for those.
-Official React hooks remain available from `@modelcontextprotocol/ext-apps/react`.
-Standard MCP clients continue to see ordinary `content[].text` tool results.
+The iframe never needs the Agent's Bearer token or a webhook secret. The host
+owns its credentials and viewer context; the server owns the business decision.
+
+## Official open-source SDKs vs. what this package adds
+
+| Responsibility                                                         | Official package / tool                                                            | What `@nia-teams/mcp-sdk` adds                                                                     |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| MCP server/client, schemas, transports, `tools/call`, `resources/read` | `@modelcontextprotocol/sdk` (`McpServer`, Streamable HTTP, `InMemoryTransport`)    | No replacement; use these directly                                                                 |
+| RS256 signatures, JWT/JWK validation, remote/local JWKS                | `jose`                                                                             | Nia issuer/audience defaults, subject/group policy, bounded exact-call human/source context checks |
+| Interactive `ui://` HTML resources and UI tools                        | `@modelcontextprotocol/ext-apps/server` (`registerAppTool`, `registerAppResource`) | Unchanged re-exports, workspace/thread/admin metadata, convenient registration                     |
+| `App`, `ui/initialize`, iframe postMessage JSON-RPC, React hooks       | `@modelcontextprotocol/ext-apps` and its `/react` export                           | JSON REST-to-tool adapter; no custom bridge or React hook implementation                           |
+| Single-file HTML/JS/CSS bundling                                       | Vite + `vite-plugin-singlefile`                                                    | A working example; no regex bundler                                                                |
+| Human confirmation card rendering and callbacks                        | Nia Teams Host                                                                     | `_niaCard` builders, action results, HMAC helpers; no custom card renderer                         |
+| Workspace viewer and REST bridge defenses                              | Authenticated host + enterprise application                                        | Bound-viewer validation and strict traversal/query/route allowlists                                |
+| Offline extension tests                                                | Official SDK `InMemoryTransport` + `jose`                                          | Local test issuer, RSA keys, confirmation/viewer-context signers                                   |
+
+This package does **not** replace MCP, implement an Apps host, or bundle upstream
+SDKs. Standard MCP clients continue to see ordinary `content[].text` results.
 
 ## Install
 
@@ -132,7 +211,13 @@ business transaction/CAS or nonce ledger. HMAC has no timestamp of its own.
 import {
   registerNiaWorkspaceApp,
   verifyBoundViewer,
+  createSafeApiPathChecker,
 } from "@nia-teams/mcp-sdk/apps";
+
+const allowed = createSafeApiPathChecker({
+  get: [{ pattern: /^\/api\/reports$/, queryKeys: ["limit"] }],
+  post: [/^\/api\/reports\/refresh$/],
+});
 
 registerNiaWorkspaceApp(server, {
   resourceUri: "ui://example/dashboard",
@@ -152,7 +237,17 @@ registerNiaWorkspaceApp(server, {
     name: "dashboard_api",
     handler: async ({ method, path, body }, extra) => {
       const viewer = verifyBoundViewer(extra._meta, { requireTeamAdmin: true });
-      // Check createSafeApiPathChecker(...), then dispatch to your own business layer.
+      if (!allowed(method, path)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Forbidden route" }],
+          structuredContent: {
+            status: 403,
+            body: { error: "Forbidden route" },
+          },
+        };
+      }
+      // Dispatch only to your application's authorization-aware business layer.
       const response = await dispatchAuthorizedApi({
         method,
         path,
@@ -210,6 +305,7 @@ rewrite script chunks or implement your own `ui/initialize` / postMessage bridge
 import {
   createWorkloadOidcProvider,
   generateTestRsaKeyPair,
+  signTestConfirmationToken,
 } from "@nia-teams/mcp-sdk/testing";
 import { createWorkloadOidcVerifier } from "@nia-teams/mcp-sdk/auth";
 const provider = createWorkloadOidcProvider({
@@ -225,12 +321,30 @@ const token = await provider.signIdToken({
   claims: { principal_type: "workload" },
 });
 await verifier.verifyBearerHeader(`Bearer ${token}`);
+
+const confirmationToken = await signTestConfirmationToken(provider, {
+  server: "changes",
+  tool: "apply_change",
+  arguments: { changeId: "change-123", expectedVersion: 7 },
+  cardId: "changes:change-123",
+});
+await verifier.verifyHumanActionContext(
+  { "nia/confirmationToken": confirmationToken },
+  {
+    server: "changes",
+    tool: "apply_change",
+    arguments: { changeId: "change-123", expectedVersion: 7 },
+    expectedCardId: "changes:change-123",
+  },
+);
 ```
 
 `signTestConfirmationToken(provider, { server, tool, arguments, cardId, ... })`
 and `signTestViewerContextToken(...)` sign bounded human-context JWTs. They return
 token strings, not enclosing metadata. The provider must have TTL <= 300 seconds.
-Test-only keys and issuers must never become production trust anchors.
+Combine these with the official SDK's `InMemoryTransport` for real MCP
+Server/Client round trips. Test-only keys and issuers must never become production
+trust anchors.
 
 ## Examples and development
 
