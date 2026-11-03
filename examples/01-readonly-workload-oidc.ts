@@ -14,7 +14,7 @@ export const httpServer = createServer(async (req, res) => {
     transport: StreamableHTTPServerTransport | undefined;
   try {
     const identity = await auth.verifyBearerHeader(req.headers.authorization, {
-      requiredGroups: ["role:logs.reader"],
+      requiredGroups: ["org:acme"],
     });
     if (req.url !== "/mcp" || req.method !== "POST") {
       res.writeHead(404).end();
@@ -24,7 +24,7 @@ export const httpServer = createServer(async (req, res) => {
     server.registerTool(
       "query_logs",
       {
-        description: "Query logs belonging to the authenticated Team",
+        description: "Query logs belonging to the authenticated Agent and organization",
         inputSchema: { limit: z.number().int().min(1).max(100).default(20) },
         annotations: { readOnlyHint: true },
       },
@@ -34,6 +34,7 @@ export const httpServer = createServer(async (req, res) => {
             type: "text",
             text: JSON.stringify({
               subject: identity.subject,
+              orgs: identity.orgs,
               limit,
               rows: [],
             }),
