@@ -68,5 +68,5 @@ server.registerTool(
   },
 );
 // Mount behind an authenticated MCP HTTP transport (example 01).
-// Permit the platform service bearer only on this callback path; separately verify
+// Permit the Nia Teams service bearer only on this callback path; separately verify
 // the exact signed human context above. Service identity alone never authorizes writes.

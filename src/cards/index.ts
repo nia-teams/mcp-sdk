@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual, randomUUID } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { VerifiedCardCallbackContext } from "../auth/index.js";
 import { canonicalJsonSha256 } from "../canonical-json.js";
 
 export type CardStatus = "pending" | "running" | "success" | "failed";
@@ -239,4 +240,53 @@ export function verifyCardSignature(
     Buffer.from(signCardBody(secret, body)),
     Buffer.from(headerValue),
   );
+}
+
+/** Report a started async operation with running status. */
+export function cardActionRunning(
+  options: Omit<NonNullable<Parameters<typeof cardActionSuccess>[0]>, "status"> = {},
+): CallToolResult {
+  return cardActionSuccess({
+    ...options,
+    status: "running",
+    text: options.text ?? options.statusLabel ?? "Action running",
+  });
+}
+
+export interface CardStatusUpdate {
+  status: "running" | "success" | "failed";
+  statusLabel?: string | null;
+  result?: Record<string, unknown>;
+  errorMessage?: string;
+}
+
+/** An HTTP rejection from the card status endpoint. */
+export class CardStatusError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(`Card status callback failed (HTTP ${status})`);
+    this.name = "CardStatusError";
+  }
+}
+
+/** Send a status update using a verified card callback. */
+export async function postCardStatus(
+  callback: VerifiedCardCallbackContext,
+  update: CardStatusUpdate,
+  options: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
+): Promise<void> {
+  const response = await (options.fetchImpl ?? fetch)(callback.callbackUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${callback.token}`,
+    },
+    body: JSON.stringify(update),
+    redirect: "error",
+    signal: options.signal ?? AbortSignal.timeout(30_000),
+  });
+  if (!response.ok)
+    throw new CardStatusError(response.status, await response.text().catch(() => ""));
 }

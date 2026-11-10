@@ -1,7 +1,7 @@
 {
   "name": "@nia-teams/mcp-sdk",
-  "version": "0.1.0",
-  "description": "Nia Teams authentication, confirmation cards, and workspace helpers for official MCP SDKs",
+  "version": "0.1.1",
+  "description": "Nia Teams authentication, confirmation cards, and workspace helpers for MCP servers",
   "type": "module",
   "license": "MIT",
   "author": "Nia Teams",
@@ -25,6 +25,7 @@
     "examples/workspace-ui/*.html",
     "examples/workspace-ui/package.json",
     "examples/workspace-ui/tsconfig.json",
+    "examples/workspace-ui/vite.config.ts",
     "LICENSE"
   ],
   "sideEffects": false,

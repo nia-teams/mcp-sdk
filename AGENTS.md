@@ -1,17 +1,23 @@
-# AGENTS.md
+# Repository maintenance
 
-Repository context for AI coding agents maintaining `@nia-teams/mcp-sdk`.
+This repository adds Nia Teams authentication, cards, and Workspace metadata to `@modelcontextprotocol/sdk` and `@modelcontextprotocol/ext-apps`. Upstream packages own MCP transport, resource registration, and iframe messaging.
 
-- Building an MCP server with `@nia-teams/mcp-sdk`: read `skills/nia-teams-mcp/SKILL.md`.
-- Wire-level JWT claims, canonical JSON rules, and `_niaCard` / `_meta` schemas: read `docs/SPECIFICATION.md`.
+## Runtime and protocol boundaries
 
-## Scope & Layering
+- Server exports target Node.js 20+; `src/apps/client.ts` uses browser APIs and `@modelcontextprotocol/ext-apps`.
+- Canonical JSON sorts plain-object keys by UTF-16 code units, preserves dense-array order, and hashes UTF-8 bytes. It rejects unsupported values and cycles; `-0` serializes as `0`.
+- Human confirmation and viewer proofs have a 300-second lifetime limit. Card status credentials have a 7200-second limit and are rejected as human contexts.
+- Callback URLs derive from the configured verified issuer and encoded card ID; status requests reject redirects.
+- Workspace metadata is registration data; authenticated handlers enforce viewer and business permissions.
 
-`@nia-teams/mcp-sdk` layers Nia Teams group-chat primitives onto `@modelcontextprotocol/sdk` and `@modelcontextprotocol/ext-apps` (SEP-1865). Standard MCP transport, tool schemas, `ui://` resource serving, and `postMessage` bridging stay in the upstream `@modelcontextprotocol/*` packages; this repository maintains only Workload OIDC and call-context verification (`src/auth`), TaskBar card envelopes and webhook HMAC (`src/cards`), Workspace App registration and viewer verification (`src/apps`), the browser-only client adapter (`src/apps/client.ts`), and offline OIDC fixtures (`src/testing`).
+## Contract updates
 
-## Invariants
+Update `README.md`, `README_CN.md`, `skills/nia-teams-mcp/SKILL.md`, `docs/SPECIFICATION.md`, tests, and runnable examples when changing public contracts. Type declarations derive from source.
 
-- **Browser runtime boundary**: `src/apps/client.ts` depends strictly on web-standard APIs and `@modelcontextprotocol/ext-apps`, validated by `tsconfig.check.json` (`types: []`, `DOM` lib). Server subpaths target Node.js 20+.
-- **Canonical JSON wire parity**: `src/canonical-json.ts` matches the Nia Teams host digest implementation byte-for-byte — plain objects with UTF-16 code-unit sorted keys (`Array.prototype.sort()`), dense arrays, finite numbers (`-0` serialized as `"0"`), throwing `TypeError` on `undefined`, class instances, sparse arrays, non-finite numbers, and circular references.
-- **Contract sync**: Changes to exported APIs, JWT claims, `_meta` keys, or card envelopes update `docs/SPECIFICATION.md`, `skills/nia-teams-mcp/SKILL.md`, `README.md`, and `README_CN.md` together.
-- **Verification**: Run `npm test`, `npm run typecheck`, and `npm run build` (plus `npm --prefix examples/workspace-ui run typecheck` and `build` when modifying `src/apps/client.ts` or `examples/workspace-ui/`), and check `npm pack --dry-run` against `package.json` `files` before release.
+Consumer integration guidance lives in `skills/nia-teams-mcp/SKILL.md`; protocol schemas live in `docs/SPECIFICATION.md`.
+
+## Verification
+
+Run `npm test`, `npm run typecheck`, `npm run build`, and `npm pack --dry-run`.
+Run `npm --prefix examples/workspace-ui run typecheck` and `npm --prefix examples/workspace-ui run build` for browser changes.
+Keep executable README TypeScript blocks identical to their `examples/` scripts and include example build configuration in the tarball.

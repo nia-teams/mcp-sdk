@@ -64,7 +64,7 @@ registerNiaWorkspaceApp(server, {
     },
   },
 });
-// These are official ext-apps/server helpers re-exported unchanged for custom setups.
+// These are @modelcontextprotocol/ext-apps/server helpers re-exported unchanged for custom setups.
 void registerAppTool;
 void registerAppResource;
 // Authenticate the transport and restrict authorized Team/role mounts before trusting

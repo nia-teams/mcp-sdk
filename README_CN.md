@@ -2,477 +2,257 @@
 
 [English](./README.md) | 简体中文
 
-面向 [Nia Teams](https://nia-teams.com) 的 MCP Server 扩展 SDK，基于 [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) 与 [`@modelcontextprotocol/ext-apps`](https://github.com/modelcontextprotocol/ext-apps) 实现 Workload OIDC 验签、TaskBar 确认卡与 Workspace App。
+面向 [Nia Teams](https://nia-teams.com) 的 MCP 服务端扩展：Workload OIDC 验签、TaskBar 确认卡与工作区应用。
 
 ```sh
 npm install @nia-teams/mcp-sdk @modelcontextprotocol/sdk @modelcontextprotocol/ext-apps zod
 ```
 
-使用 AI 编程助手（Nia Teams Agent、Claude Code、Codex 等）开发时，可直接加载 `node_modules/@nia-teams/mcp-sdk/skills/nia-teams-mcp/SKILL.md`（或仓库内 [`skills/nia-teams-mcp/SKILL.md`](./skills/nia-teams-mcp/SKILL.md)）。
+AI 编程助手加载 `node_modules/@nia-teams/mcp-sdk/skills/nia-teams-mcp/SKILL.md`（[仓库副本](./skills/nia-teams-mcp/SKILL.md)）。
 
-## 一、背景
+## 群聊接入
 
-### Nia Teams
+Nia Teams 是人与 AI Agent 协作的群聊应用，成员通过 Agent 调用已挂载的 MCP 工具。
 
-Nia Teams 是人与 AI Agent 协作的群聊应用。每个 Agent 有独立的成员列表，成员角色分为 `owner`、`admin`、`member`。企业将内部日志系统、数据库、发布系统封装为 MCP Server 并挂载到 Agent 后，群聊成员即可 `@` Agent 调用其中的 Tool。
+截图使用虚构身份与演示数据。
 
-MCP 规范定义了 client 与 server 之间的工具调用协议。接入多人群聊后，还有三方面规范未覆盖：
+![群聊中的确认卡、工作区侧边栏与应用菜单](./docs/assets/group-chat-overview.png)
 
-- **调用方身份**：MCP Server 需要识别调用方是哪个 Agent、属于哪个组织（`org`）、被授予了哪些权限标识（`role`）；
-- **人工确认**：高危写操作需在人工确认后执行，即 Human-in-the-loop；
-- **交互式 UI**：表单、看板等 UI 需要在群聊中有固定的呈现位置和访问入口。
+Workload OIDC 标识调用方 Agent 及其所属组织。`@modelcontextprotocol/sdk` 负责 MCP 传输与工具注册，本包负责 Nia Teams 身份和调用上下文校验。
 
-Nia Teams 针对这三点分别提供 Workload OIDC、TaskBar 和 Workspace App，本 SDK 提供三者的服务端实现。
+TaskBar 展示等待成员确认的操作卡片。
 
-![Nia Teams 群聊界面（TaskBar 确认卡、Workspace 侧边栏与 Apps 菜单）](./docs/assets/group-chat-overview.png)
+![输入框上方的确认卡](./docs/assets/taskbar-card.png)
 
-### Workload OIDC
+工作区应用在右侧边栏和群聊应用菜单中打开。`@modelcontextprotocol/ext-apps` 负责 iframe 与 `postMessage` 协议，本包提供 Nia Teams 注册元数据和访问者校验。
 
-Nia Teams 作为 OIDC Issuer（`https://nia-teams.com`），调用 MCP Server 时在 `Authorization` header 中携带 RS256 签名的 JWT。claims 包含 Agent 标识（`sub`）及其所属 `team`、`org` 与权限标识 `role`（放在 `groups` 数组中）。MCP Server 使用公开的 JWKS（`https://nia-teams.com/oauth2/jwks`）验证签名，无需分发或轮换静态 API Key。
+![工作区侧边栏中的应用](./docs/assets/workspace-app.png)
 
-JWT 有效期 5 分钟，到期前由 Nia Teams 自动刷新。完整 claims 定义见第六章及 [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)。
+## 快速开始
 
-### TaskBar
-
-TaskBar 位于群聊输入框上方，展示待确认的操作卡片。
-
-![TaskBar 确认卡](./docs/assets/taskbar-card.png)
-
-接入 TaskBar 的写操作需拆分为两个 Tool：
-
-1. **Propose tool**：由 Agent 调用，返回 `_niaCard` 结构，Nia Teams 将其渲染为 TaskBar 中的确认卡。该 Tool 不应产生副作用。
-2. **Execute tool**：有权限的成员点击确认后，由 Nia Teams 回调。请求的 `_meta` 中携带 `nia/confirmationToken`，该 JWT 绑定确认人、card ID、目标 server 与 tool，以及参数的 SHA-256 摘要（基于 canonical JSON），用于防止参数篡改和审计追溯。
-
-### Workspace App
-
-[MCP Apps](https://github.com/modelcontextprotocol/ext-apps)（SEP-1865，`@modelcontextprotocol/ext-apps`）是 MCP 的 UI 扩展协议：Tool 可声明一个 `ui://` HTML resource，由客户端以 iframe 渲染，页面通过 `postMessage` 调用 server 端 Tool。多数客户端将其内联渲染在消息流中。
-
-Nia Teams 在 MCP Apps 之上增加了以下能力：
-
-- **Workspace 侧边栏**：声明 `_meta["nia/workspace"]` 后，App 在群聊右侧以独立面板打开，移动端全屏显示；
-- **Apps 菜单入口**：声明 `_meta["openai/ui.entrypoints"]` 后，App 固定在群聊顶部的 Apps 菜单中，成员可直接打开，无需经由 Agent 调用；
-- **Viewer context**：每次 tool call 由 Nia Teams 注入当前操作者的 user ID 与成员角色（`owner` / `admin` / `member`）；声明 `_meta["nia/requireTeamAdmin"]` 后，该 App 对 `member` 不可见。
-
-![Workspace 侧边栏中打开的运维控制台](./docs/assets/workspace-app.png)
-
-### MCP 基础协议与 Nia Teams 扩展的分工
-
-| 模块 | `@modelcontextprotocol/sdk` & `@modelcontextprotocol/ext-apps` | Nia Teams 扩展 |
-| --- | --- | --- |
-| 传输与工具调用 | Streamable HTTP、JSON-RPC、`McpServer` | 无 |
-| 身份认证 | 预留 `Authorization` header 与 `_meta` | Workload OIDC JWT、confirmation token 验签 |
-| 人工确认 | `structuredContent` | `_niaCard` 构建、TaskBar 渲染、execute tool 回调 |
-| 交互式 UI | MCP Apps（`ui://` resource、iframe、`postMessage`） | Workspace 侧边栏、Apps 菜单入口、viewer context |
-
-传输层与 MCP Apps 直接使用 `@modelcontextprotocol/sdk` 和 `@modelcontextprotocol/ext-apps`；`@nia-teams/mcp-sdk` 提供右列中 MCP Server 侧需要的构建与校验。
-
----
-
-## 二、安装与子路径
-
-环境要求：Node.js 20+（ESM + TypeScript 类型声明）。
+运行环境为 Node.js 20+ 与 ESM，以下命令在仓库目录中运行。[只读服务示例](./examples/01-readonly-workload-oidc.ts)返回演示日志：
 
 ```sh
-npm install @nia-teams/mcp-sdk @modelcontextprotocol/sdk @modelcontextprotocol/ext-apps zod
+npm ci
+npm run build
+RUN_EXAMPLE=1 npx tsx examples/01-readonly-workload-oidc.ts
 ```
-
-使用 AI 编程助手（Nia Teams Agent、Claude Code、Codex 等）开发时，可直接加载 `node_modules/@nia-teams/mcp-sdk/skills/nia-teams-mcp/SKILL.md`（或仓库内 [`skills/nia-teams-mcp/SKILL.md`](./skills/nia-teams-mcp/SKILL.md)）。
-
-| 子路径 | 运行环境 | 职责 |
-| --- | --- | --- |
-| `@nia-teams/mcp-sdk/auth` | Node.js | 验证 `Authorization` Bearer JWT、`nia/confirmationToken` 与参数 canonical JSON 摘要 |
-| `@nia-teams/mcp-sdk/cards` | Node.js | 构建 `_niaCard` 确认卡、生成执行结果、验证 Webhook HMAC 签名 |
-| `@nia-teams/mcp-sdk/apps` | Node.js | 注册 Workspace App（`ui://`）、验证 viewer context、配置 API 路径白名单 |
-| `@nia-teams/mcp-sdk/apps/client` | 浏览器 | 重导出 `@modelcontextprotocol/ext-apps` 的 `App` / `PostMessageTransport`，提供 `createMcpAppFetch` 适配器 |
-| `@nia-teams/mcp-sdk/testing` | Node.js（单测） | 内存态 OIDC Provider、测试密钥对与 confirmation token 签发工具 |
-| `@nia-teams/mcp-sdk` | Node.js | 服务端聚合入口（重导出 `auth`、`cards`、`apps`、`testing`） |
-
----
-
-## 三、快速接入
-
-### 1. 启动带 OIDC 验签的 MCP Server
-
-使用 `@modelcontextprotocol/sdk` 的 `StreamableHTTPServerTransport` 暴露 `/mcp` 端点，在分发 MCP 请求前调用 `auth.verifyBearerHeader` 验证请求头：
 
 ```ts
-import { createServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer } from "node:http";
 import { z } from "zod";
-import { createWorkloadOidcVerifier, WorkloadOidcError } from "@nia-teams/mcp-sdk/auth";
+import {
+  createWorkloadOidcVerifier,
+  WorkloadOidcError,
+} from "@nia-teams/mcp-sdk/auth";
 
 const auth = createWorkloadOidcVerifier();
-
-createServer(async (req, res) => {
-  if (req.url !== "/mcp" || req.method !== "POST") {
-    res.writeHead(404).end();
-    return;
-  }
-
-  let server: McpServer | undefined;
-  let transport: StreamableHTTPServerTransport | undefined;
+/** Authenticate before parsing/dispatching MCP. Bind data queries to the verified identity. */
+export const httpServer = createServer(async (req, res) => {
+  let server: McpServer | undefined,
+    transport: StreamableHTTPServerTransport | undefined;
   try {
-    // 验证 Authorization Bearer JWT：
-    // 默认仅接受 Agent 调用（principalType: "workload"），
-    // 解析出 identity.subject（Agent slug）与 identity.orgs（所属组织 slug）
-    const identity = await auth.verifyBearerHeader(req.headers.authorization);
-
-    server = new McpServer({ name: "ops-service", version: "1.0.0" });
-
+    const identity = await auth.verifyBearerHeader(req.headers.authorization, {
+      requiredGroups: ["org:acme"],
+    });
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(404).end();
+      return;
+    }
+    server = new McpServer({ name: "enterprise-logs", version: "1.0.0" });
     server.registerTool(
-      "query_service_logs",
+      "query_logs",
       {
-        description: "查询指定服务的错误日志",
-        inputSchema: {
-          service: z.string(),
-          limit: z.number().int().min(1).max(100).default(20),
-        },
+        description: "Query logs belonging to the authenticated Agent and organization",
+        inputSchema: { limit: z.number().int().min(1).max(100).default(20) },
+        annotations: { readOnlyHint: true },
       },
-      async ({ service, limit }) => {
-        if (!identity.orgs.includes("acme")) {
-          throw new WorkloadOidcError(403, "仅允许 acme 组织下的 Agent 调用");
-        }
-        const rows = await queryLogsFromDb({
-          agent: identity.subject,
-          orgs: identity.orgs,
-          service,
-          limit,
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
-        };
-      },
+      async ({ limit }) => ({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              subject: identity.subject,
+              orgs: identity.orgs,
+              limit,
+              rows: [],
+            }),
+          },
+        ],
+      }),
     );
-
-    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
     await server.connect(transport);
     await transport.handleRequest(req, res);
-  } catch (err) {
-    if (!res.headersSent) {
-      if (err instanceof WorkloadOidcError) {
-        res.writeHead(err.statusCode, { "WWW-Authenticate": "Bearer" }).end(err.message);
-      } else {
-        res.writeHead(500).end("Internal Server Error");
-      }
-    }
+  } catch (error) {
+    if (!res.headersSent)
+      res
+        .writeHead(
+          error instanceof WorkloadOidcError ? error.statusCode : 500,
+          { "WWW-Authenticate": "Bearer" },
+        )
+        .end("Request rejected");
   } finally {
     await transport?.close();
     await server?.close();
   }
-}).listen(3000);
-```
-
-### 2. 挂载至 Agent
-
-将服务部署至公网可达的 HTTPS 地址（如 `https://ops.acme.com/mcp`，不支持 `localhost` 及私网地址），在群聊中向目标 Agent 发送指令：
-
-> 连接名为 `ops` 的 MCP Server，地址为 `https://ops.acme.com/mcp`
-
-Agent 调用内置 `mcp_servers` Tool（`action: "update"`）在 TaskBar 生成配置变更确认卡，由该 Agent 的 `owner` 或 `admin` 点击「确认修改」后生效。
-
-挂载时不要配置自定义 `Authorization` header：保持为空时，Nia Teams 自动在每次请求中注入 Workload OIDC JWT；若配置了静态 `Authorization` header，Nia Teams 将不再注入 Workload OIDC JWT。服务端注册的 Tool 名称 `query_service_logs` 在 Agent 侧映射为 `mcp__ops__query_service_logs`。
-
----
-
-## 四、TaskBar 确认卡
-
-将写操作拆分为两个 Tool：`propose_restart` 作为 propose tool 由 Agent 调用，返回确认卡且不修改业务状态；`execute_restart` 作为 execute tool，在成员点击确认后由 Nia Teams 回调执行。
-
-Nia Teams 回调 execute tool 时，外层 HTTP `Authorization` header 携带的是服务身份（`sub: "nia-teams-platform"`，`principal_type: "service"`）。因此接收确认卡回调的 `/mcp` 入口需在 `verifyBearerHeader` 中开启 `allowServicePrincipal: true`，并在普通只读/提议 Tool 内检查 `identity.principalType === "workload"`：
-
-```ts
-import { z } from "zod";
-import {
-  createMcpConfirmCard,
-  cardToolResult,
-  cardActionSuccess,
-  cardActionError,
-} from "@nia-teams/mcp-sdk/cards";
-
-// HTTP 入口验签时开启 allowServicePrincipal: true，以允许 Nia Teams 回调 execute_restart：
-// const identity = await auth.verifyBearerHeader(req.headers.authorization, { allowServicePrincipal: true });
-
-// 1. Propose tool：由 Agent 调用，向 TaskBar 返回确认卡
-server.registerTool(
-  "propose_restart",
-  {
-    description: "发起服务重启提议，生成 TaskBar 确认卡等待人工批准",
-    inputSchema: { service: z.string(), reason: z.string(), expectedVersion: z.number().int() },
-  },
-  async (args) => {
-    if (identity.principalType !== "workload") {
-      throw new WorkloadOidcError(403, "Requires Agent workload principal");
-    }
-    await db.savePendingRestart(args);
-    return cardToolResult(
-      `已创建重启 ${args.service} 的确认卡，等待人工确认。`,
-      createMcpConfirmCard({
-        cardId: `restart:${args.service}:v${args.expectedVersion}`,
-        title: `重启 ${args.service}`,
-        subtitle: `v${args.expectedVersion}`,
-        description: args.reason,
-        actionLabel: "确认重启",
-        server: "ops", // 对应 Agent 上的 MCP 挂载名称
-        toolName: "execute_restart",
-        arguments: args,
-      }),
-    );
-  },
-);
-
-// 2. Execute tool：成员在 TaskBar 点击确认后由 Nia Teams 回调
-server.registerTool(
-  "execute_restart",
-  {
-    inputSchema: { service: z.string(), reason: z.string(), expectedVersion: z.number().int() },
-    annotations: { destructiveHint: true },
-  },
-  async (args, extra) => {
-    // 验证 nia/confirmationToken，校验 server、tool、cardId 与参数摘要
-    const human = await auth.verifyHumanActionContext(extra._meta, {
-      server: "ops",
-      tool: "execute_restart",
-      arguments: args,
-      expectedCardId: `restart:${args.service}:v${args.expectedVersion}`,
-    });
-
-    // human.confirmedBy 为确认人的 24 位十六进制 Nia Teams user ID
-    if (!(await db.canUserRestartService(human.confirmedBy, args.service))) {
-      return cardActionError("仅服务负责人可执行重启", {
-        errorKind: "auth_forbidden",
-      });
-    }
-
-    // 通过数据库版本号 CAS 保证幂等，防止并发点击或重放
-    const applied = await db.applyRestartCas(args.service, args.expectedVersion, {
-      approvedBy: human.confirmedBy,
-      approvedByName: human.confirmedByName,
-      jti: human.jti,
-    });
-    if (!applied) {
-      return cardActionError("该操作已执行或版本号已变更");
-    }
-
-    return cardActionSuccess({
-      statusLabel: "已重启",
-      result: { service: args.service, approvedBy: human.confirmedBy },
-    });
-  },
-);
-```
-
-若需在确认后触发异步 HTTP Webhook 而非回调 MCP Tool，可使用 `createWebhookConfirmCard({ title, url, mcpServerName: "ops", pendingInput })`。挂载或更新该 MCP Server 时，通过内置 `mcp_servers` Tool 在 `upsert` 项中传入 `webhookSecret` 字段（如 `{ name: "ops", url: "https://ops.acme.com/mcp", webhookSecret: "whsec_..." }`），并在 Webhook 接收端通过 `verifyCardSignature(secret, rawBodyBuffer, req.headers["x-nia-signature"])` 验证原始请求体签名。
-
----
-
-## 五、Workspace App
-
-前端通过 `vite-plugin-singlefile` 构建为单文件 HTML，服务端通过 `registerNiaWorkspaceApp` 注册 `ui://` resource 与对应的 Tool。iframe 内无需处理任何认证凭据。
-
-### 1. 前端构建与调用
-
-```ts
-// ui/vite.config.ts
-import { defineConfig } from "vite";
-import { viteSingleFile } from "vite-plugin-singlefile";
-
-export default defineConfig({
-  plugins: [viteSingleFile()],
 });
+// Run with a TypeScript runner, then connect an authenticated HTTP MCP client.
+if (process.env.RUN_EXAMPLE === "1") httpServer.listen(3000, "127.0.0.1");
 ```
 
-前端代码仅导入浏览器入口 `@nia-teams/mcp-sdk/apps/client`：
+## 挂载配置
+
+服务使用公网可达的 HTTPS 地址，Nia Teams 不接受回环地址与私网地址。在群聊中向目标 Agent 发送：
+
+> 连接名为 `ops` 的 MCP 服务，地址为 `https://ops.example.com/mcp`
+
+Agent 的 `mcp_servers` 工具在 TaskBar 中提出挂载配置，由该 Agent 的 `owner` 或 `admin` 确认。
+
+挂载配置中的 `Authorization` 请求头留空时，Nia Teams 注入 Workload OIDC 凭证；静态 `Authorization` 请求头会停用该注入。挂载名称为 `ops` 时，服务端的 `query_logs` 工具在 Agent 侧显示为 `mcp__ops__query_logs`。
+
+## 确认卡
+
+提议工具通过 `cardToolResult` 与 `createMcpConfirmCard` 返回确认卡，不修改业务状态。卡片的 `server` 与 Agent 的 MCP 挂载名称一致。
+
+执行工具通过 `auth.verifyHumanActionContext` 校验 `extra._meta`，根据 `human.confirmedBy` 检查业务权限，并通过持久化幂等记录或版本 CAS 执行变更。[确认卡示例](./examples/02-taskbar-confirm-card.ts)使用内存演示存储注册这两个工具。
+
+MCP 确认回调携带 Nia Teams 服务身份。接收回调的 HTTP 路由向 `verifyBearerHeader` 传入 `{ allowServicePrincipal: true }`；普通只读、提议和工作区工具要求 `identity.principalType === "workload"`。
+
+Webhook 接入使用 `createWebhookConfirmCard`。挂载配置的 `mcp_servers` `upsert` 项通过 `webhookSecret` 设置密钥，接收方通过 `verifyCardSignature` 校验原始请求体。[协议规范](./docs/SPECIFICATION.md#33-webhook-card-dispatch--signatures)定义回调鉴权方式。
+
+## 异步卡片状态
+
+`auth.verifyCardCallbackContext(context, { server, expectedCardId? })` 校验 MCP 元数据或 Webhook `{ callbackToken }` 中的状态凭证，返回包含 `cardId`、`callbackUrl`、`token`、`claims` 的 `VerifiedCardCallbackContext`。
+
+`cardActionRunning` 返回已入队或已启动的作业状态。`postCardStatus` 使用已验证的回调地址与凭证发送 `CardStatusUpdate`，拒绝重定向，未传入 `signal` 时采用 30 秒超时。
+
+执行确认的有效期上限为 300 秒，状态凭证的有效期上限为 7200 秒。请在执行工具入队时校验人工确认上下文，不要延迟到工作进程中校验。状态凭证仅授权卡片更新，不授权业务执行。将回调上下文存入作业私有存储，不回显到工具输出或日志。
+
+串行发送同一张卡片的状态更新。若作业可能超过两小时，请在凭证的 `exp` 截止时间前发送终态 `failed` 和超时摘要。SDK 不提供请求重试或凭证刷新。
+
+从 `@nia-teams/mcp-sdk/cards` 导入并捕获 `CardStatusError`，读取数字属性 `status` 和响应文本属性 `body`。错误消息格式为 `Card status callback failed (HTTP <status>)`，消息不包含响应正文。不要将 `body` 回显到公开输出或日志。传输失败仍抛出 fetch 原始错误。
+
+`409 Conflict` 表示卡片状态发生并发变更。收到 `409` 时，请丢弃该次 `running` 更新；终态（`success` 或 `failed`）更新请重试一次。若该次重试仍失败，请报告错误，不再重试。已处于终态的卡片收到迟到的 `running` 更新时返回 HTTP `200`，不修改状态。挂载被移除、停用或指纹变更（含 URL 或请求头变更）会使回调凭证失效；Nia Teams 返回 `401 Unauthorized`，不回退到 HMAC。收到鉴权拒绝后请停止更新。终态更新不发送 `action`，Nia Teams 会清除卡片按钮，并在来源群聊的当前会话可解析时投递完成事件。
+
+[离线示例](./examples/04-async-card-status.ts)使用临时签名密钥和模拟 HTTP 发送器：
+
+```sh
+npm run build
+npx tsx examples/04-async-card-status.ts
+```
 
 ```ts
-// ui/src/main.ts
-import { App, createMcpAppFetch } from "@nia-teams/mcp-sdk/apps/client";
-
-const app = new App({ name: "运维控制台", version: "1.0.0" });
-const apiFetch = createMcpAppFetch({ app, apiToolName: "ops_console_api" });
-
-// 首次请求自动完成 app.connect()，通过 postMessage 调用服务端的 ops_console_api
-const res = await apiFetch("/api/incidents?status=open");
-const { incidents } = await res.json();
-```
-
-### 2. 服务端注册
-
-`registerNiaWorkspaceApp` 的 `workspace`（默认 `true`）、`threadEntrypoint`、`requireTeamAdmin` 选项会自动生成第一章所述的 `_meta["nia/workspace"]`、`_meta["openai/ui.entrypoints"]` 与 `_meta["nia/requireTeamAdmin"]` 字段：
-
-```ts
-import { readFile } from "node:fs/promises";
-import {
-  registerNiaWorkspaceApp,
-  verifyBoundViewer,
-  createSafeApiPathChecker,
-} from "@nia-teams/mcp-sdk/apps";
-
-const isAllowedRoute = createSafeApiPathChecker({
-  get: [{ pattern: /^\/api\/incidents$/, queryKeys: ["status", "limit"] }],
-  post: [/^\/api\/incidents\/[a-z0-9-]+\/ack$/],
-});
-
-registerNiaWorkspaceApp(server, {
-  resourceUri: "ui://ops/console",
-  html: () => readFile(new URL("../ui/dist/index.html", import.meta.url), "utf8"),
-  threadEntrypoint: true, // 写入 _meta["openai/ui.entrypoints"]，固定在群聊顶部 Apps 菜单
-  requireTeamAdmin: true, // 写入 _meta["nia/requireTeamAdmin"]，仅对该 Agent 的 owner 与 admin 可见
-  visibility: ["app"], // 仅允许群聊 Apps 菜单与 iframe 调用，不对 Agent 模型暴露该 Tool
-  entryTool: {
-    name: "open_ops_console",
-    title: "运维控制台",
-    handler: async (extra) => {
-      verifyBoundViewer(extra._meta, { requireTeamAdmin: true });
-      return { content: [{ type: "text", text: "运维控制台已就绪" }] };
-    },
-  },
-  apiTool: {
-    name: "ops_console_api",
-    handler: async ({ method, path, body }, extra) => {
-      const viewer = verifyBoundViewer(extra._meta, { requireTeamAdmin: true });
-
-      if (!isAllowedRoute(method, path)) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "Forbidden route" }],
-          structuredContent: { status: 403, body: { error: "Forbidden route" } },
-        };
-      }
-
-      const result = await handleIncidentApi({ method, path, body, actorId: viewer.viewerUserId });
-      return {
-        content: [{ type: "text", text: `HTTP ${result.status}` }],
-        structuredContent: { status: result.status, body: result.body },
-      };
-    },
-  },
-});
-```
-
----
-
-## 六、Token 结构与角色鉴权
-
-MCP 请求包含两层身份信息：外层 HTTP `Authorization` header 标识调用方（Agent 或 Nia Teams 回调服务），内层 MCP `_meta` 标识触发确认或访问页面的具体群聊成员。
-
-### 1. Workload OIDC JWT（HTTP Header）
-
-`verifyBearerHeader` 验证并解析的 JWT payload 示例：
-
-```json
-{
-  "iss": "https://nia-teams.com",
-  "aud": "nia-teams-workload",
-  "sub": "ops-agent",
-  "principal_type": "workload",
-  "groups": ["team:ops-agent", "org:acme", "role:ops.reader"],
-  "iat": 1790812800,
-  "exp": 1790813100
-}
-```
-
-- `identity.subject`（`sub`）与 `identity.teams`（`team:<slug>`）：Agent 的唯一标识（`slug`），创建 Agent 时生成（可在群聊中询问该 Agent，或从其分享链接 `/f/<slug>/...` 查看）。当成员点击 TaskBar 确认卡触发回调时，外层 JWT 为 Nia Teams 回调服务身份：`sub: "nia-teams-platform"`、`principal_type: "service"`。
-- `identity.orgs`（`org:<slug>`）：Agent 所属组织的标识（`slug`），创建组织时生成（个人 Agent 无 `org:*` 项）。
-- `identity.roles`（`role:<key>`）：绑定在该 Agent 上的权限标识（如 `role:ops.reader`），与人类成员在 Agent 上的 `owner` / `admin` / `member` 角色相互独立。`role:*` 由 Nia Teams 创建并绑定到 Agent，接入方如需使用请联系 Nia Teams；常规接入使用 `sub`（`team:*`）和 `org:*` 即可。
-
-### 2. Confirmation Token（`_meta["nia/confirmationToken"]`）
-
-成员点击 TaskBar 确认按钮后，Nia Teams 在 `extra._meta["nia/confirmationToken"]` 中传入的签名 JWT 示例：
-
-```json
-{
-  "iss": "https://nia-teams.com",
-  "aud": "nia-teams-workload",
-  "sub": "nia-teams-platform",
-  "principal_type": "service",
-  "human_confirmed": true,
-  "confirmed_by": "65f000000000000000000001",
-  "confirmed_by_name": "Alice",
-  "confirmation_card_id": "restart:payments-api:v3",
-  "context_server": "ops",
-  "context_tool": "execute_restart",
-  "context_arguments_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-  "iat": 1790812860,
-  "exp": 1790813160,
-  "jti": "38a1b544-89ef-4a0e-b8c1-7640219c5511"
-}
-```
-
-`verifyHumanActionContext` 校验签名、5 分钟有效期、`context_server`、`context_tool`、`confirmation_card_id` 与参数摘要，返回 `confirmedBy`（user ID）与 `confirmedByName`。
-
-### 3. 成员角色（`owner` / `admin` / `member`）鉴权方式
-
-- **MCP Server 挂载配置**：群聊成员均可要求 Agent 发起挂载提议，但仅该 Agent 的 `owner` 或 `admin` 可确认生效。
-- **TaskBar 确认卡回调**：Nia Teams 默认校验点击者为发出卡片的 Agent 成员（`owner`、`admin`、`member`）。如需限制特定审批人，可在服务端根据 `human.confirmedBy` 查询业务权限表；若需转发点击者在外部系统的 OAuth 凭证，可在构建卡片时声明 `requiresIdentity: { provider: "gitlab", instance: "gitlab.example.com" }`（当前内置支持 `"gitlab"`，对应 GitLab 实例需已在 Nia Teams 完成 OAuth App 接入，如需接入自建实例请联系 Nia Teams；Nia Teams 会在成员点击时校验或引导绑定，并将 access token 注入 `human.identityToken`）。
-- **Workspace App 访问控制**：Nia Teams 在每次调用 `entryTool` 与 `apiTool` 时于 `extra._meta.boundContext` 中注入当前操作者的 `viewerUserId` 与 `viewerTeamRole`。服务端须先在 HTTP 入口通过 `verifyBearerHeader` 验证外层连接（并限制 `allowedSubjects` / `requiredGroups`），再调用 `verifyBoundViewer` 校验成员角色：
-  - 允许 `owner`、`admin`、`member`：`verifyBoundViewer(extra._meta)`
-  - 仅允许 `owner` 与 `admin`：`verifyBoundViewer(extra._meta, { requireTeamAdmin: true })`
-  - 仅允许 `owner`：校验 `if (viewer.viewerTeamRole !== "owner") throw new WorkloadOidcError(403, "Owner required")`
-
----
-
-## 七、离线单元测试
-
-`@nia-teams/mcp-sdk/testing` 提供内存态 OIDC Provider 与 token 签发函数，可配合 `@modelcontextprotocol/sdk` 的 `InMemoryTransport` 在本地运行单元测试：
-
-```ts
-import { expect, test } from "vitest";
+import assert from "node:assert/strict";
 import { createWorkloadOidcVerifier } from "@nia-teams/mcp-sdk/auth";
+import { cardActionRunning, postCardStatus } from "@nia-teams/mcp-sdk/cards";
 import {
   createWorkloadOidcProvider,
   generateTestRsaKeyPair,
   signTestConfirmationToken,
 } from "@nia-teams/mcp-sdk/testing";
 
-test("verifies workload JWT and confirmation token offline", async () => {
-  const provider = createWorkloadOidcProvider({
-    issuer: "https://nia-teams.com",
-    audience: "nia-teams-workload",
-    tokenTtlSeconds: 300,
-    activeKey: await generateTestRsaKeyPair(),
-  });
-
-  const auth = createWorkloadOidcVerifier({ jwks: await provider.getJwks() });
-
-  const agentJwt = await provider.signIdToken({
-    subject: "ops-agent",
-    groups: ["team:ops-agent", "org:acme", "role:ops.reader"],
-    claims: { principal_type: "workload" },
-  });
-  const identity = await auth.verifyBearerHeader(`Bearer ${agentJwt}`, {
-    requiredGroups: ["role:ops.reader"],
-  });
-  expect(identity.subject).toBe("ops-agent");
-
-  const args = { service: "payments-api", expectedVersion: 3 };
-  const confirmationToken = await signTestConfirmationToken(provider, {
-    server: "ops",
-    tool: "execute_restart",
-    arguments: args,
-    cardId: "restart:payments-api:v3",
-    confirmedBy: "65f000000000000000000001",
-    confirmedByName: "Alice",
-  });
-
-  const human = await auth.verifyHumanActionContext(
-    { "nia/confirmationToken": confirmationToken },
-    { server: "ops", tool: "execute_restart", arguments: args, expectedCardId: "restart:payments-api:v3" },
-  );
-  expect(human.confirmedByName).toBe("Alice");
+// Offline fixtures: no business mutation or request to Nia Teams occurs here.
+const issuer = "https://teams.example";
+const activeKey = await generateTestRsaKeyPair();
+const executionProvider = createWorkloadOidcProvider({
+  issuer, audience: "nia-teams-workload", tokenTtlSeconds: 300, activeKey,
 });
+const statusProvider = createWorkloadOidcProvider({
+  issuer, audience: "nia-teams-workload", tokenTtlSeconds: 7200, activeKey,
+});
+const auth = createWorkloadOidcVerifier({
+  issuer, jwks: await executionProvider.getJwks(),
+});
+const args = { buildNumber: 11 };
+const binding = {
+  server: "jenkins", tool: "execute_build", arguments: args, cardId: "build:11",
+};
+const meta = {
+  "nia/confirmationToken": await signTestConfirmationToken(executionProvider, binding),
+  "nia/cardCallbackToken": await statusProvider.signIdToken({
+    subject: "nia-teams-platform",
+    claims: {
+      principal_type: "service", token_use: "card_callback",
+      confirmation_card_id: binding.cardId, context_server: binding.server,
+      context_config_sha256: "a".repeat(64),
+    },
+  }),
+};
+const human = await auth.verifyHumanActionContext(meta, {
+  ...binding, expectedCardId: binding.cardId,
+});
+// Production executors recheck business permissions and enqueue with durable CAS.
+assert.equal(human.confirmedBy, "0123456789abcdef01234567");
+const callback = await auth.verifyCardCallbackContext(meta, {
+  server: binding.server, expectedCardId: human.cardId,
+});
+const queued = cardActionRunning({ statusLabel: "Queued #11", result: args });
+assert.equal(queued.structuredContent?.status, "running");
+
+// A worker loads the verified callback from private job storage.
+const updates: unknown[] = [];
+const fetchImpl: typeof fetch = async (url, init) => {
+  assert.equal(url, "https://teams.example/api/cards/build%3A11/webhook");
+  assert.equal(init?.redirect, "error");
+  assert.equal(new Headers(init?.headers).get("Authorization"), `Bearer ${callback.token}`);
+  updates.push(JSON.parse(String(init?.body)));
+  return new Response(null, { status: 204 });
+};
+await postCardStatus(callback, {
+  status: "running", statusLabel: "Stage 2/4",
+}, { fetchImpl });
+await postCardStatus(callback, {
+  status: "success", statusLabel: "Build succeeded #11", result: args,
+}, { fetchImpl });
+assert.equal(updates.length, 2);
+console.log("Verified confirmation, queued result, and two mocked status updates.");
 ```
 
----
+## 工作区应用与权限
 
-## 八、示例与规范文档
+[服务端示例](./examples/03-workspace-mcp-app.ts)通过 `registerNiaWorkspaceApp` 注册 HTML、入口工具和 API 工具。[前端工程](./examples/workspace-ui/)构建单文件 HTML，从 `@nia-teams/mcp-sdk/apps/client` 导入浏览器适配器。
 
-- 可运行示例：
-  - [`examples/01-readonly-workload-oidc.ts`](./examples/01-readonly-workload-oidc.ts) —— 带 Workload OIDC 鉴权的只读日志查询服务
-  - [`examples/02-taskbar-confirm-card.ts`](./examples/02-taskbar-confirm-card.ts) —— Propose / Execute 双步确认卡与版本 CAS
-  - [`examples/03-workspace-mcp-app.ts`](./examples/03-workspace-mcp-app.ts) 与 [`examples/workspace-ui/`](./examples/workspace-ui) —— Workspace App 服务端与单文件前端工程
-- AI 编码 Skill（供接入方 AI 加载）：`node_modules/@nia-teams/mcp-sdk/skills/nia-teams-mcp/SKILL.md`（[`skills/nia-teams-mcp/SKILL.md`](./skills/nia-teams-mcp/SKILL.md)）
-- 协议规范（底层 Wire 格式参考）：[`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md)
+```sh
+npm --prefix examples/workspace-ui install
+npm --prefix examples/workspace-ui run typecheck
+npm --prefix examples/workspace-ui run build
+npx tsx examples/02-taskbar-confirm-card.ts
+npx tsx examples/03-workspace-mcp-app.ts
+```
+
+示例 02、03 在注册工具后退出，HTTP 托管采用示例 01 的鉴权传输方式。
+
+`requireTeamAdmin: true` 在 Nia Teams 中对 `member` 隐藏应用入口。服务端处理器通过 `verifyBoundViewer(extra._meta, { requireTeamAdmin: true })` 校验 `owner`/`admin` 权限，通过 `createSafeApiPathChecker` 限制 API 路径。访问者元数据属于宿主声明，接收方先校验传输身份与 Agent 或组织权限。
+
+Agent 成员角色（`owner`、`admin`、`member`）管理挂载与应用访问。Workload 的 `role:*` 分组是 Nia Teams 分配的权限标识，配置方式可联系 Nia Teams。接入方通过 `allowedSubjects` 或 `requiredGroups` 授权调用方，通过业务权限授权确认人。需要外部 OAuth 身份的卡片声明 `requiresIdentity`，GitLab 实例接入可联系 Nia Teams。
+
+## 导出入口
+
+| 子路径 | 运行环境 | 职责 |
+| --- | --- | --- |
+| `@nia-teams/mcp-sdk` | Node.js | 聚合导出 `auth`、`cards`、`apps`、`testing` |
+| `@nia-teams/mcp-sdk/auth` | Node.js | 校验调用方、确认人、来源和卡片回调上下文 |
+| `@nia-teams/mcp-sdk/cards` | Node.js | 卡片构建、执行结果、状态更新与 Webhook HMAC |
+| `@nia-teams/mcp-sdk/apps` | Node.js | 工作区注册、访问者校验与 API 路径限制 |
+| `@nia-teams/mcp-sdk/apps/client` | 浏览器 | `App`、`PostMessageTransport`、`createMcpAppFetch`、`isMcpAppEmbedded` |
+| `@nia-teams/mcp-sdk/testing` | Node.js | 离线 OIDC 签发器、密钥和确认上下文签发函数 |
+
+类型签名见 `dist/**/*.d.ts`。[协议规范](./docs/SPECIFICATION.md)定义签名声明、canonical JSON、卡片结构和状态更新报文。
+
+## 本地验证
+
+```sh
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm pack --dry-run
+```
 
 ## 开源协议
 

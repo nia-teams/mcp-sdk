@@ -75,6 +75,12 @@ export interface VerifiedHumanActionContext {
   sourceTeam?: VerifiedSourceTeam;
   claims: JWTPayload;
 }
+export interface VerifiedCardCallbackContext {
+  cardId: string;
+  callbackUrl: string;
+  token: string;
+  claims: JWTPayload;
+}
 export interface VerifiedSourceContext {
   sourceTeam: VerifiedSourceTeam;
   humanActorUserId?: string;
@@ -234,6 +240,46 @@ export function createWorkloadOidcVerifier(
         claims,
       };
     },
+    /** Verify a status-only capability, never an execution authorization. */
+    async verifyCardCallbackContext(
+      context: Record<string, unknown> | undefined,
+      expected: { server: string; expectedCardId?: string },
+    ): Promise<VerifiedCardCallbackContext> {
+      const token = context && ("callbackToken" in context
+        ? context.callbackToken
+        : context["nia/cardCallbackToken"]);
+      if (!nonempty(token))
+        throw new WorkloadOidcError(401, "Card callback token required");
+      const claims = await verify(token);
+      if (
+        !service(claims) ||
+        !nonempty(claims.confirmation_card_id) ||
+        claims.context_server !== expected.server ||
+        (expected.expectedCardId !== undefined &&
+          claims.confirmation_card_id !== expected.expectedCardId) ||
+        claims.token_use !== "card_callback"
+      ) {
+        forbidden("Invalid card callback binding");
+      }
+      const time = Math.floor(now().getTime() / 1000);
+      if (
+        !Number.isInteger(claims.iat) ||
+        !Number.isInteger(claims.exp) ||
+        claims.iat! > time ||
+        claims.exp! <= claims.iat! ||
+        claims.exp! - claims.iat! > 7200 ||
+        time - claims.iat! > 7200 ||
+        !nonempty(claims.context_config_sha256)
+      ) {
+        forbidden("Invalid card callback lifetime");
+      }
+      // The configured issuer and signed card ID define the credential's endpoint.
+      const callbackUrl = `${issuer}/api/cards/${encodeURIComponent(claims.confirmation_card_id)}/webhook`;
+      if (claims.callback_url !== undefined && claims.callback_url !== callbackUrl) {
+        forbidden("Invalid card callback URL");
+      }
+      return { cardId: claims.confirmation_card_id, callbackUrl, token, claims };
+    },
     async verifyHumanActionContext(
       meta: Record<string, unknown> | undefined,
       expected: ExpectedHumanActionContext,
@@ -242,7 +288,9 @@ export function createWorkloadOidcVerifier(
       const claims = await verify(
         meta?.[confirmed ? "nia/confirmationToken" : "nia/viewerContextToken"],
       );
-      if (!service(claims)) forbidden("Platform service context required");
+      if (!service(claims)) forbidden("Nia Teams service context required");
+      if (claims.token_use === "card_callback")
+        forbidden("Card callback token is not a human context");
       checkContext(claims, expected);
       if (
         claims.human_confirmed !== confirmed ||

@@ -2,7 +2,7 @@ import { App } from "@modelcontextprotocol/ext-apps";
 import { createMcpAppFetch } from "@nia-teams/mcp-sdk/apps/client";
 const app = new App({ name: "Reports", version: "1.0.0" });
 const fetchApi = createMcpAppFetch({ app, apiToolName: "reports_api" });
-// The first call connects via the official ui/initialize handshake.
+// The first call connects via the MCP Apps ui/initialize handshake.
 async function main() {
   try {
     const response = await fetchApi("/api/reports?limit=20");
